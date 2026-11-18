@@ -74,7 +74,23 @@ export async function systemRoutes(app: FastifyInstance): Promise<void> {
       db.prepare("SELECT id FROM sites WHERE type = 'node'").all() as { id: number }[]
     ).map((r) => `app-${r.id}`)
     const apacheUnits = fs.existsSync('/etc/apache2') ? ['apache2'] : []
-    const units = ['nginx', ...installedPhpVersions().map((v) => `php${v}-fpm`), 'panel', ...apacheUnits, ...nodeUnits]
+    const mariadbUnits = fs.existsSync('/usr/bin/mariadb') ? ['mariadb'] : []
+    const mailUnits = fs.existsSync('/etc/postfix/main.cf') ? ['postfix'] : []
+    const imapUnits = fs.existsSync('/etc/dovecot') ? ['dovecot'] : []
+    const dkimUnits = fs.existsSync('/etc/opendkim.conf') ? ['opendkim'] : []
+    const f2bUnits = fs.existsSync('/etc/fail2ban') ? ['fail2ban'] : []
+    const units = [
+      'nginx',
+      ...installedPhpVersions().map((v) => `php${v}-fpm`),
+      'panel',
+      ...apacheUnits,
+      ...mariadbUnits,
+      ...mailUnits,
+      ...imapUnits,
+      ...dkimUnits,
+      ...f2bUnits,
+      ...nodeUnits,
+    ]
     const statuses = await Promise.all(
       units.map(async (unit) => {
         const res = await sudo(['panel-systemctl', 'is-active', unit])

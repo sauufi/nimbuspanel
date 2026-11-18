@@ -25,6 +25,11 @@ case "$UNIT" in
     nginx | nginx.service) ;;
     apache2 | apache2.service) ;;
     panel | panel.service) ;;
+    mariadb | mariadb.service) ;;
+    postfix | postfix.service) ;;
+    dovecot | dovecot.service) ;;
+    opendkim | opendkim.service) ;;
+    fail2ban | fail2ban.service) ;;
     php[0-9].[0-9]-fpm | php[0-9].[0-9]-fpm.service) ;;
     app-* | app-*.service) ;;
     *) echo "panel-systemctl: unit not allowed: $UNIT" >&2; exit 77 ;;
