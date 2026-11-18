@@ -30,16 +30,23 @@ Native performance. Zero Docker overhead. Runs on 1GB RAM.
 
 ## 🚀 Quick Start
 
+### One-line install (recommended)
+
 ```bash
-# 1. Provision your server (fresh Ubuntu 24.04 / Debian 12)
+curl -sSL https://nimbus.sauu.fi/install.sh | bash
+```
+
+That's it. Open `http://your-server-ip` when it finishes.
+
+### Manual install
+
+```bash
+git clone https://github.com/sauufi/nimbuspanel.git
 scp -r nimbuspanel root@your-server:/root/
 ssh root@your-server
-cd nimbuspanel && bash provision/provision.sh
-
-# 2. Deploy the panel
+cd nimbuspanel
+bash provision/provision.sh
 bash scripts/deploy.sh
-
-# 3. Open http://your-server-ip — done!
 ```
 
 ## 📊 Minimum Requirements
