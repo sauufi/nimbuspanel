@@ -12,6 +12,7 @@ import { filesRoutes } from './files'
 import { mailRoutes } from './mail'
 import { hostRoutes } from './host'
 import { notificationsRoutes } from './notify'
+import { setupTerminal } from './terminal'
 
 async function main(): Promise<void> {
   // Large bodyLimit for SQL imports via the panel (max 64MB)
@@ -54,6 +55,9 @@ async function main(): Promise<void> {
 
   await app.listen({ host: CONFIG.host, port: CONFIG.port })
   console.log(`[panel] backend aktif di ${CONFIG.host}:${CONFIG.port} (db: ${CONFIG.dbPath})`)
+
+  // SSH terminal WebSocket (needs the underlying http server)
+  setupTerminal(app, app.server)
 }
 
 main().catch((err) => {

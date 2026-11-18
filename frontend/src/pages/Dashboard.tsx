@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react'
 import { Link } from 'react-router-dom'
 import { Archive, Database, Globe, HardDrive, Mail, MemoryStick, ShieldCheck, Timer } from 'lucide-react'
 import { api, fmtUptime } from '../api'
+import Terminal from '../components/Terminal'
 
 interface Metrics {
   mem: { totalMb: number; usedMb: number; usedPct: number }
@@ -96,6 +97,9 @@ export default function Dashboard() {
           </div>
         </section>
       </div>
+
+      {/* Root Terminal */}
+      <Terminal asRoot title="Root Terminal — server console" />
     </div>
   )
 }
