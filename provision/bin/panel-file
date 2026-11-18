@@ -1,0 +1,116 @@
+#!/usr/bin/env bash
+# ============================================================
+# panel-file — file manager operations for one site's tree.
+# Invoked via sudo by user 'panel'. All paths are RELATIVE to the
+# site root and validated strictly (charset whitelist, no leading
+# '/', no '..' segment) so writes can never escape the site dir.
+# Mutating operations run AS THE SITE USER (ownership stays correct
+# for PHP-FPM pools and node apps).
+#
+#   panel-file <domain> list     <relpath>
+#   panel-file <domain> read     <relpath>              (file → stdout)
+#   panel-file <domain> download <relpath>              (file → stdout)
+#   panel-file <domain> write     relpath  < content     (stdin → file)
+#   panel-file <domain> upload    relpath  < base64      (decoded → file)
+#   panel-file <domain> mkdir    <relpath>
+#   panel-file <domain> rm       <relpath>              (recursive)
+#   panel-file <domain> rename   <from> <to>
+# ============================================================
+set -euo pipefail
+
+DOMAIN_RE='^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$'
+REL_RE='^[A-Za-z0-9._+@/ -]{1,255}$'
+
+fail() { echo "panel-file: $*" >&2; exit 1; }
+
+DOMAIN="${1:-}"; ACTION="${2:-}"
+
+[ $# -ge 2 ] || { echo "usage: panel-file <domain> <list|read|write|upload|download|mkdir|rm|rename> [args]" >&2; exit 64; }
+DOMAIN="${DOMAIN,,}"
+[[ "$DOMAIN" =~ $DOMAIN_RE ]] || fail "invalid domain: $DOMAIN"
+
+SITE_ROOT="/var/www/$DOMAIN"
+SITE_USER="site-$(printf '%s' "$DOMAIN" | md5sum | cut -c1-8)"
+id -u "$SITE_USER" &>/dev/null || fail "site does not exist"
+[ -d "$SITE_ROOT" ] || fail "site root missing"
+
+valid_rel() {
+    local p="${1:-}"
+    [ -n "$p" ] || fail "empty path"
+    [[ "$p" =~ $REL_RE ]] || fail "invalid characters in path (spaces/unicode not supported yet)"
+    case "$p" in
+        /*) fail "path must be relative to the site root" ;;
+    esac
+    local seg
+    IFS='/' read -ra segs <<< "$p"
+    for seg in "${segs[@]}"; do
+        [ -n "$seg" ] || fail "empty path segment"
+        [ "$seg" = "." ] || [ "$seg" = ".." ] && fail "path traversal not allowed"
+    done
+    return 0
+}
+
+AS_USER() { runuser -u "$SITE_USER" -- "$@"; }
+
+case "$ACTION" in
+    list)
+        [ $# -eq 3 ] || fail "usage: list <relpath>"
+        REL="$3"
+        if [ -z "$REL" ]; then
+            DIR="$SITE_ROOT"
+        else
+            valid_rel "$REL"
+            DIR="$SITE_ROOT/$REL"
+        fi
+        [ -d "$DIR" ] || fail "not a directory: ${REL:-(root)}"
+        (cd "$DIR" && find . -mindepth 1 -maxdepth 1 -printf '%y\t%s\t%TY-%Tm-%Td %TH:%TM\t%f\n' | sort -t$'\t' -k4)
+        ;;
+    read | download)
+        [ $# -eq 3 ] || fail "usage: $ACTION <relpath>"
+        REL="$3"; valid_rel "$REL"
+        F="$SITE_ROOT/$REL"
+        [ -f "$F" ] || fail "not a file: $REL"
+        SIZE=$(stat -c%s "$F")
+        [ "$SIZE" -le $((2 * 1024 * 1024)) ] || fail "file too large ($SIZE bytes) — use download"
+        cat "$F"
+        ;;
+    write)
+        [ $# -eq 3 ] || fail "usage: write <relpath>"
+        REL="$3"; valid_rel "$REL"
+        AS_USER mkdir -p "$(dirname "$SITE_ROOT/$REL")"
+        AS_USER bash -c "umask 022; cat > '$SITE_ROOT/$REL'"
+        echo "OK: $REL saved"
+        ;;
+    upload)
+        [ $# -eq 3 ] || fail "usage: upload <relpath>"
+        REL="$3"; valid_rel "$REL"
+        AS_USER mkdir -p "$(dirname "$SITE_ROOT/$REL")"
+        AS_USER bash -c "umask 022; base64 -d > '$SITE_ROOT/$REL'"
+        echo "OK: $REL uploaded"
+        ;;
+    mkdir)
+        [ $# -eq 3 ] || fail "usage: mkdir <relpath>"
+        REL="$3"; valid_rel "$REL"
+        AS_USER mkdir -p "$SITE_ROOT/$REL"
+        echo "OK: $REL created"
+        ;;
+    rm)
+        [ $# -eq 3 ] || fail "usage: rm <relpath>"
+        REL="$3"; valid_rel "$REL"
+        [ -e "$SITE_ROOT/$REL" ] || fail "not found: $REL"
+        AS_USER rm -rf -- "$SITE_ROOT/$REL"
+        echo "OK: $REL deleted"
+        ;;
+    rename)
+        [ $# -eq 4 ] || fail "usage: rename <from> <to>"
+        FROM="$3"; TO="$4"; valid_rel "$FROM"; valid_rel "$TO"
+        [ -e "$SITE_ROOT/$FROM" ] || fail "not found: $FROM"
+        [ -e "$SITE_ROOT/$TO" ] && fail "target already exists: $TO"
+        AS_USER mkdir -p "$(dirname "$SITE_ROOT/$TO")"
+        AS_USER mv "$SITE_ROOT/$FROM" "$SITE_ROOT/$TO"
+        echo "OK: $FROM → $TO"
+        ;;
+    *)
+        fail "unknown action: $ACTION"
+        ;;
+esac

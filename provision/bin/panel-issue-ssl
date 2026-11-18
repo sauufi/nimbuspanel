@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+# ============================================================
+# panel-issue-ssl — issue/renew a Let's Encrypt certificate.
+# Invoked via sudo by user 'panel'.
+#
+#   sudo /opt/panel/bin/panel-issue-ssl <domain>
+#
+# - Domain names are validated strictly (no paths/odd characters)
+#   because the domain is used to build filesystem paths.
+# - Webroot mode: the site must already exist and DNS must point
+#   to this server (nginx serves /.well-known/acme-challenge/).
+# - The certificate is installed to /etc/nginx/ssl/<domain>/ and
+#   nginx is reloaded automatically on renewal (--reloadcmd).
+# ============================================================
+set -euo pipefail
+
+ACME_HOME="/etc/panel/acme"
+SSL_ROOT="/etc/nginx/ssl"
+WWW_ROOT="/var/www"
+
+DOMAIN="${1:-}"
+DOMAIN_RE='^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$'
+
+[ $# -eq 1 ] || { echo "usage: panel-issue-ssl <domain>" >&2; exit 64; }
+DOMAIN="${DOMAIN,,}"   # force lowercase
+[[ "$DOMAIN" =~ $DOMAIN_RE ]] || { echo "panel-issue-ssl: invalid domain: $DOMAIN" >&2; exit 64; }
+
+WEBROOT="$WWW_ROOT/$DOMAIN/htdocs"
+[ -d "$WEBROOT" ] || {
+    echo "panel-issue-ssl: webroot not found: $WEBROOT (create the site in the panel first)" >&2
+    exit 66
+}
+
+SSL_DIR="$SSL_ROOT/$DOMAIN"
+mkdir -p "$SSL_DIR"
+
+"$ACME_HOME/acme.sh" \
+    --home "$ACME_HOME" \
+    --issue --server letsencrypt \
+    -d "$DOMAIN" -w "$WEBROOT" \
+    --key-file "$SSL_DIR/privkey.pem" \
+    --fullchain-file "$SSL_DIR/fullchain.pem" \
+    --reloadcmd "systemctl reload nginx"
+
+echo "OK: certificate installed at $SSL_DIR/fullchain.pem"

@@ -1,0 +1,225 @@
+#!/usr/bin/env bash
+# ============================================================
+# panel-hostname — own the panel's own nginx vhost end to end.
+# Invoked via sudo by user 'panel'.
+#
+#   panel-hostname status               → key=value lines
+#   panel-hostname set-ip               → default mode: panel on
+#                                          http://<server-ip>/ (only when
+#                                          no panel vhost exists yet)
+#   panel-hostname set-domain <domain>  → named vhost + Let's Encrypt
+#                                          (needs DNS pointing here; falls
+#                                          back to HTTP-only with ssl=pending)
+#   panel-hostname issue-ssl <domain>   → (re)try issuing the certificate
+#
+# The panel vhost /etc/nginx/sites-available/panel.conf is regenerated
+# wholly (a timestamped backup is kept), validated with nginx -t, and
+# the managed webmail location is re-included automatically when the
+# panel-domain webmail is installed. Postfix/Dovecot TLS copies are
+# refreshed when the certificate changes.
+# ============================================================
+set -euo pipefail
+
+DOMAIN_RE='^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$'
+VHOST="/etc/nginx/sites-available/panel.conf"
+VHOST_ENABLED="/etc/nginx/sites-enabled/panel.conf"
+CERT_DIR="/etc/nginx/ssl/panel"
+CHALLENGE="/var/www/panel-challenge"
+ACME_HOME="/etc/panel/acme"
+BACKEND="http://127.0.0.1:3444"
+
+fail() { echo "panel-hostname: $*" >&2; exit 1; }
+
+proxy_loc() {
+    cat <<EOF
+        location / {
+            proxy_pass $BACKEND;
+            proxy_set_header Host \$host;
+            proxy_set_header X-Real-IP \$remote_addr;
+            proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto \$scheme;
+        }
+EOF
+}
+
+webmail_loc() {
+    [ -d /var/www/panel-webmail/htdocs/webmail ] || return 0
+    local pool
+    pool="$(ls /etc/php/*/fpm/pool.d/panel-webmail.conf 2>/dev/null | head -1)"
+    [ -n "$pool" ] || return 0
+    # versi = segmen path tepat setelah /etc/php/ (mis. "8.3") — bukan rantai dirname
+    local pv socket
+    pv="${pool#/etc/php/}"
+    pv="${pv%%/*}"
+    socket="/run/php/php$pv-fpm-panel-webmail.sock"
+    cat <<EOF
+
+    # BEGIN PANEL WEBMAIL
+    location ^~ /webmail {
+        root /var/www/panel-webmail/htdocs;
+        index index.php;
+        location ~ \.php\$ {
+            include snippets/fastcgi-php.conf;
+            fastcgi_pass unix:$socket;
+        }
+    }
+    # END PANEL WEBMAIL
+EOF
+}
+
+write_vhost_http() { # $1 = domain (or empty = ip mode) — output to stdout
+    cat <<EOF
+# managed by panel — panel-hostname (${1:-ip mode})
+server {
+    listen 80 default_server;
+    server_name _;
+
+$(proxy_loc)
+}
+EOF
+    if [ -n "$1" ]; then
+        cat <<EOF
+server {
+    listen 80;
+    server_name $1;
+
+    location ^~ /.well-known/acme-challenge/ { root $CHALLENGE; default_type text/plain; }
+    location / { return 301 https://\$host\$request_uri; }
+}
+EOF
+    fi
+}
+
+write_vhost_ssl() { # $1 = domain — output to stdout
+    cat <<EOF
+# managed by panel — panel-hostname ($1, ssl)
+server {
+    listen 80 default_server;
+    server_name _;
+
+$(proxy_loc)
+}
+server {
+    listen 80;
+    server_name $1;
+
+    location ^~ /.well-known/acme-challenge/ { root $CHALLENGE; default_type text/plain; }
+    location / { return 301 https://\$host\$request_uri; }
+}
+server {
+    listen 443 ssl http2;
+    server_name $1;
+
+    ssl_certificate     $CERT_DIR/fullchain.pem;
+    ssl_certificate_key $CERT_DIR/privkey.pem;
+    ssl_protocols TLSv1.2 TLSv1.3;
+$(webmail_loc)
+
+$(proxy_loc)
+}
+EOF
+}
+
+apply() { # validate + swap in + reload (input: candidate file path)
+    local cand="$1"
+    local backup=""
+    [ -f "$VHOST" ] && backup="$VHOST.bak-$(date +%Y%m%d%H%M%S)"
+    if [ -n "$backup" ]; then cp -a "$VHOST" "$backup"; fi
+    cp -a "$cand" "$VHOST"
+    ln -sfn "$VHOST" "$VHOST_ENABLED"
+    if ! nginx -t >/dev/null 2>&1; then
+        nginx -t 2>&1 | head -5 >&2
+        if [ -n "$backup" ]; then cp -a "$backup" "$VHOST"; fi
+        rm -f "$cand"
+        fail "nginx -t failed — previous vhost restored"
+    fi
+    rm -f "$cand"
+    systemctl reload nginx
+    # refresh salinan TLS untuk postfix/dovecot bila ada cert baru
+    if [ -f "$CERT_DIR/fullchain.pem" ] && [ -d /etc/postfix/panel-tls ]; then
+        install -m 0644 "$CERT_DIR/fullchain.pem" /etc/postfix/panel-tls/fullchain.pem
+        install -m 0600 "$CERT_DIR/privkey.pem" /etc/postfix/panel-tls/privkey.pem
+        systemctl reload postfix >/dev/null 2>&1 || true
+        systemctl reload dovecot >/dev/null 2>&1 || true
+    fi
+}
+
+issue_cert() { # $1 = domain → 0 ok, 1 gagal (DNS dsb.)
+    mkdir -p "$CHALLENGE" "$CERT_DIR"
+    local out
+    out="$("$ACME_HOME/acme.sh" --home "$ACME_HOME" --issue --server letsencrypt \
+        -d "$1" -w "$CHALLENGE" 2>&1 || true)"
+    if ! echo "$out" | grep -qE 'Cert success|Domains not changed'; then
+        echo "$out" | tail -3 >&2
+        return 1
+    fi
+    "$ACME_HOME/acme.sh" --home "$ACME_HOME" --install-cert -d "$1" \
+        --key-file "$CERT_DIR/privkey.pem" \
+        --fullchain-file "$CERT_DIR/fullchain.pem" \
+        --reloadcmd "if [ -d /etc/postfix/panel-tls ]; then install -m 0644 $CERT_DIR/fullchain.pem /etc/postfix/panel-tls/fullchain.pem && install -m 0600 $CERT_DIR/privkey.pem /etc/postfix/panel-tls/privkey.pem && systemctl reload postfix dovecot; fi; systemctl reload nginx" >/dev/null 2>&1
+    return 0
+}
+
+ACTION="${1:-}"
+
+case "$ACTION" in
+    status)
+        MODE="none"; HOST="-"; SSL="no"
+        if [ -f "$VHOST" ]; then
+            HOST="$(grep '^    server_name' "$VHOST" | grep -v 'server_name _' | head -1 | awk '{print $2}' | tr -d ';' || true)"
+            if [ -n "${HOST:-}" ] && [ "$HOST" != "_" ]; then
+                MODE="domain"
+                grep -q 'ssl_certificate ' "$VHOST" && SSL="yes" || SSL="pending"
+            else
+                MODE="ip"
+            fi
+        fi
+        [ -d /var/www/panel-webmail/htdocs/webmail ] && WM="yes" || WM="no"
+        printf 'mode=%s\nhostname=%s\nssl=%s\nwebmail=%s\n' "$MODE" "$HOST" "$SSL" "$WM"
+        ;;
+    set-ip)
+        # hanya untuk pemasangan baru — jangan menimpa vhost yang sudah ada
+        if [ -f "$VHOST" ]; then
+            echo "panel-hostname: panel vhost already exists — use set-domain; nothing to do"
+            exit 0
+        fi
+        CAND="$(mktemp)"
+        { write_vhost_http ""; } > "$CAND"
+        apply "$CAND"
+        echo "OK: panel now reachable at http://<server-ip>/ (default mode)"
+        ;;
+    set-domain)
+        [ $# -eq 2 ] || fail "usage: set-domain <domain>"
+        D="${2,,}"
+        [[ "$D" =~ $DOMAIN_RE ]] || fail "invalid domain: $D"
+        mkdir -p "$CHALLENGE"
+        # tahap 1: vhost HTTP (webroot siap, domain belum SSL)
+        CAND="$(mktemp)"
+        { write_vhost_http "$D"; } > "$CAND"
+        apply "$CAND"
+        # tahap 2: sertifikat
+        if issue_cert "$D"; then
+            CAND="$(mktemp)"
+            { write_vhost_ssl "$D"; } > "$CAND"
+            apply "$CAND"
+            echo "OK: panel hostname $D with SSL active (webmail included when installed)"
+        else
+            echo "OK-with-warning: hostname $D saved (HTTP only) — DNS may not point here yet; run issue-ssl later" >&2
+            echo "ssl=pending"
+            exit 3
+        fi
+        ;;
+    issue-ssl)
+        [ $# -eq 2 ] || fail "usage: issue-ssl <domain>"
+        D="${2,,}"
+        [[ "$D" =~ $DOMAIN_RE ]] || fail "invalid domain: $D"
+        issue_cert "$D" || fail "certificate issuance failed — check DNS for $D"
+        CAND="$(mktemp)"
+        { write_vhost_ssl "$D"; } > "$CAND"
+        apply "$CAND"
+        echo "OK: SSL active for $D"
+        ;;
+    *)
+        fail "unknown action: ${ACTION:-empty}"
+        ;;
+esac

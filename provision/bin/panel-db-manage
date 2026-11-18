@@ -1,0 +1,85 @@
+#!/usr/bin/env bash
+# ============================================================
+# panel-db-manage — manage MariaDB databases for the panel.
+# Invoked via sudo by user 'panel'. All arguments are validated:
+# db/user identifiers only [a-z0-9_] (backtick-safe), passwords use
+# a restricted charset, and strings are escaped before hitting SQL.
+#
+#   panel-db-manage create <dbname> <dbuser> <dbpass>
+#   panel-db-manage drop   <dbname> <dbuser>
+#   panel-db-manage passwd <dbuser> <dbpass>
+#   panel-db-manage list
+#   panel-db-manage dump   <dbname>     (dump → stdout)
+#   panel-db-manage import <dbname>     (SQL from stdin)
+# ============================================================
+set -euo pipefail
+
+NAME_RE='^[a-z][a-z0-9_]{0,38}$'
+PASS_RE='^[A-Za-z0-9._@+-]{10,64}$'
+SYS_RE='^(mysql|sys|performance_schema|information_schema)$'
+
+MARIADB=/usr/bin/mariadb
+MARIADB_DUMP=/usr/bin/mariadb-dump
+
+fail() { echo "panel-db-manage: $*" >&2; exit 1; }
+esc()  { printf '%s' "$1" | sed "s/'/''/g"; }
+valid_name() { [[ "$1" =~ $NAME_RE ]] || fail "invalid name '$1' (a-z, 0-9, _ ; max 39 chars, must start with a letter)"; }
+valid_pass() { [[ "$1" =~ $PASS_RE ]] || fail "invalid password (10-64 chars; letters/digits/._@+-)"; }
+not_sys()    { [[ "$1" =~ $SYS_RE ]] && fail "system databases cannot be modified"; return 0; }
+
+ACTION="${1:-}"
+
+case "$ACTION" in
+    create)
+        [ $# -eq 4 ] || fail "usage: create <dbname> <dbuser> <dbpass>"
+        DB="$2"; DBUSER="$3"; DBPASS="$4"
+        valid_name "$DB"; valid_name "$DBUSER"; valid_pass "$DBPASS"; not_sys "$DB"
+        U="$(esc "$DBUSER")"; P="$(esc "$DBPASS")"
+        $MARIADB <<SQL
+CREATE DATABASE IF NOT EXISTS \`$DB\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+CREATE USER IF NOT EXISTS '$U'@'localhost';
+ALTER USER '$U'@'localhost' IDENTIFIED BY '$P';
+GRANT ALL PRIVILEGES ON \`$DB\`.* TO '$U'@'localhost';
+FLUSH PRIVILEGES;
+SQL
+        echo "OK: database $DB ready (user $DBUSER)"
+        ;;
+    drop)
+        [ $# -eq 3 ] || fail "usage: drop <dbname> <dbuser>"
+        DB="$2"; DBUSER="$3"
+        valid_name "$DB"; valid_name "$DBUSER"; not_sys "$DB"
+        $MARIADB <<SQL
+DROP DATABASE IF EXISTS \`$DB\`;
+DROP USER IF EXISTS '$(esc "$DBUSER")'@'localhost';
+FLUSH PRIVILEGES;
+SQL
+        echo "OK: database $DB removed"
+        ;;
+    passwd)
+        [ $# -eq 3 ] || fail "usage: passwd <dbuser> <dbpass>"
+        DBUSER="$2"; DBPASS="$3"
+        valid_name "$DBUSER"; valid_pass "$DBPASS"
+        $MARIADB <<SQL
+ALTER USER '$(esc "$DBUSER")'@'localhost' IDENTIFIED BY '$(esc "$DBPASS")';
+FLUSH PRIVILEGES;
+SQL
+        echo "OK: password for $DBUSER changed"
+        ;;
+    list)
+        $MARIADB -N -B -e "SELECT table_schema, IFNULL(ROUND(SUM(data_length+index_length)/1024/1024,1),0), COUNT(*) FROM information_schema.tables WHERE table_schema NOT REGEXP '^(mysql|sys|information_schema|performance_schema)$' GROUP BY table_schema ORDER BY table_schema;"
+        ;;
+    dump)
+        [ $# -eq 2 ] || fail "usage: dump <dbname>"
+        DB="$2"; valid_name "$DB"; not_sys "$DB"
+        exec $MARIADB_DUMP --single-transaction --routines "$DB"
+        ;;
+    import)
+        [ $# -eq 2 ] || fail "usage: import <dbname>"
+        DB="$2"; valid_name "$DB"; not_sys "$DB"
+        $MARIADB "$DB"
+        echo "OK: import into $DB finished"
+        ;;
+    *)
+        fail "unknown action: $ACTION"
+        ;;
+esac

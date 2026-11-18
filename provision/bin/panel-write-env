@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# ============================================================
+# panel-write-env — write a site's .env file from stdin.
+#   echo "KEY=value" | sudo panel-write-env <domain>
+# The stdin content is written VERBATIM to /var/www/<domain>/shared/.env
+# (owned by the site user, mode 600) — no eval, no interpolation.
+# ============================================================
+set -euo pipefail
+
+DOMAIN_RE='^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$'
+DOMAIN="${1:-}"
+
+[ $# -eq 1 ] || { echo "usage: panel-write-env <domain>" >&2; exit 64; }
+DOMAIN="${DOMAIN,,}"
+[[ "$DOMAIN" =~ $DOMAIN_RE ]] || { echo "panel-write-env: invalid domain" >&2; exit 64; }
+
+SITE_ROOT="/var/www/$DOMAIN"
+SITE_USER="site-$(printf '%s' "$DOMAIN" | md5sum | cut -c1-8)"
+id -u "$SITE_USER" &>/dev/null || { echo "panel-write-env: site does not exist" >&2; exit 66; }
+
+mkdir -p "$SITE_ROOT/shared"
+cat > "$SITE_ROOT/shared/.env.new"
+chown "$SITE_USER:$SITE_USER" "$SITE_ROOT/shared/.env.new"
+chmod 0600 "$SITE_ROOT/shared/.env.new"
+mv -f "$SITE_ROOT/shared/.env.new" "$SITE_ROOT/shared/.env"
+echo "OK: $SITE_ROOT/shared/.env updated"

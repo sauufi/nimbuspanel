@@ -1,0 +1,194 @@
+#!/usr/bin/env bash
+# ============================================================
+# panel-backup — backup/restore sites + databases + panel metadata.
+# Invoked via sudo by user 'panel' (manually from the UI) or root cron.
+#
+#   panel-backup run [--scope=all|sites|db] [--auto]
+#       Create a new backup set. --scope overrides the saved setting;
+#       --auto marks the scheduled (cron) run.
+#   panel-backup list
+#       "dir|file|size" per line.
+#   panel-backup cat    <dir> <file>       → stream a file to stdout
+#   panel-backup delete <dir> <file>       → delete one backup file
+#   panel-backup restore-db   <dir> <file> → restore db-<name>.sql.gz
+#   panel-backup restore-site <dir> <file> → restore site-<domain>.tar.gz
+#   panel-backup schedule
+#       Rewrite the root crontab entry from the settings stored in
+#       panel.db (backup_enabled, backup_time). Removes the cron line
+#       when disabled.
+#   panel-backup prune
+#       Apply the retention setting now (keep the N newest sets).
+#
+# Settings live in panel.db (meta table): backup_enabled (1/0),
+# backup_time (HH:MM), backup_retention (1-90), backup_scope
+# (all|sites|db). Sensible defaults apply when the DB is missing.
+# Each set contains: an archive per site (without repo/releases/logs —
+# rebuildable), a dump of every non-system database, and a copy of
+# panel.db. An rclone sync to the "panel-backup" remote runs
+# automatically when rclone is installed and configured.
+# ============================================================
+set -euo pipefail
+
+ROOT="/var/backups/panel"
+PANEL_DB="/opt/panel/etc/panel.db"
+DIR_RE='^[0-9]{8}-[0-9]{6}$'
+FILE_RE='^[A-Za-z0-9._-]+$'
+NAME_RE='^[a-z][a-z0-9_]{0,38}$'
+DOMAIN_RE='^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$'
+
+fail() { echo "panel-backup: $*" >&2; exit 1; }
+
+# Read a settings key from panel.db with a fallback default
+db_meta() { # $1=key $2=default
+    local v=""
+    if [ -f "$PANEL_DB" ]; then
+        v="$(sqlite3 "$PANEL_DB" "SELECT value FROM meta WHERE key='$1';" 2>/dev/null || true)"
+    fi
+    printf '%s' "${v:-$2}"
+}
+
+# Retention (validated 1-90, default 14)
+retention_of() {
+    local r
+    r="$(db_meta backup_retention 14)"
+    { [[ "$r" =~ ^[0-9]+$ ]] && [ "$r" -ge 1 ] && [ "$r" -le 90 ]; } || r=14
+    printf '%s' "$r"
+}
+
+path_of() { # $1=dir $2=file → validated path
+    [[ "$1" =~ $DIR_RE ]] || fail "invalid backup directory name"
+    [[ "$2" =~ $FILE_RE ]] || fail "invalid file name"
+    P="$ROOT/$1/$2"
+    [ -f "$P" ] || fail "backup file not found: $1/$2"
+}
+
+create_set() { # $1 = scope (all|sites|db)
+    local SCOPE="$1"
+    local STAMP DIR domain db RETAIN
+    STAMP="$(date +%Y%m%d-%H%M%S)"
+    DIR="$ROOT/$STAMP"
+    mkdir -p "$DIR"
+
+    if [ "$SCOPE" != "db" ]; then
+        for d in /var/www/*/; do
+            domain="$(basename "$d")"
+            case "$domain" in
+                html | panel-challenge | *.removed-*) continue ;;
+            esac
+            [ -d "$d/htdocs" ] || continue
+            tar czf "$DIR/site-$domain.tar.gz" -C /var/www \
+                --exclude="$domain/repo" --exclude="$domain/releases" \
+                --exclude="$domain/logs" "$domain" 2>/dev/null || true
+        done
+    fi
+
+    if [ "$SCOPE" != "sites" ]; then
+        for db in $(/usr/bin/mariadb -N -B -e "SELECT table_schema FROM information_schema.tables WHERE table_schema NOT REGEXP '^(mysql|sys|information_schema|performance_schema)$' GROUP BY table_schema"); do
+            /usr/bin/mariadb-dump --single-transaction --routines "$db" | gzip > "$DIR/db-$db.sql.gz"
+        done
+        cp -a /opt/panel/etc/panel.db "$DIR/" 2>/dev/null || true
+        cp -a /opt/panel/etc/panel.db-wal "$DIR/" 2>/dev/null || true
+        cp -a /opt/panel/etc/panel.db-shm "$DIR/" 2>/dev/null || true
+    fi
+
+    # Sync to a remote when rclone is available (remote: panel-backup)
+    if command -v rclone >/dev/null 2>&1 && [ -f /root/.config/rclone/rclone.conf ]; then
+        rclone copy "$DIR" panel-backup:"$STAMP" >/dev/null 2>&1 \
+            || echo "panel-backup: WARNING rclone sync failed (skipped)" >&2
+    fi
+
+    prune_sets
+    echo "OK: backup $STAMP finished ($(ls -1 "$DIR" | wc -l) files, scope: $SCOPE)"
+}
+
+prune_sets() { # keep the N newest sets
+    local RETAIN
+    RETAIN="$(retention_of)"
+    ls -1 "$ROOT" 2>/dev/null | sort | head -n -"$RETAIN" | while read -r old; do
+        rm -rf "$ROOT/$old"
+    done
+}
+
+case "${1:-}" in
+    run)
+        SCOPE=""
+        shift
+        while (($#)); do
+            case "$1" in
+                --scope=all | --scope=sites | --scope=db) SCOPE="${1#--scope=}" ;;
+                --auto) : ;; # scheduled run — nothing special to do
+                *) fail "unknown option: $1" ;;
+            esac
+            shift
+        done
+        [ -n "$SCOPE" ] || SCOPE="$(db_meta backup_scope all)"
+        case "$SCOPE" in
+            all | sites | db) ;;
+            *) fail "invalid scope: $SCOPE" ;;
+        esac
+        create_set "$SCOPE"
+        ;;
+    schedule)
+        ENABLED="$(db_meta backup_enabled 1)"
+        BTIME="$(db_meta backup_time 02:30)"
+        [[ "$BTIME" =~ ^([01][0-9]|2[0-3]):[0-5][0-9]$ ]] || BTIME="02:30"
+        H="${BTIME%%:*}"; M="${BTIME#*:}"
+        TMP_CRON="$(mktemp)"
+        crontab -l 2>/dev/null | grep -v 'panel-backup' > "$TMP_CRON" || true
+        if [ "$ENABLED" = "1" ]; then
+            echo "$M $H * * * /opt/panel/bin/panel-backup run --auto # panel-backup" >> "$TMP_CRON"
+            echo "OK: automatic backups enabled, daily at $BTIME"
+        else
+            echo "OK: automatic backups disabled (cron entry removed)"
+        fi
+        crontab "$TMP_CRON"
+        rm -f "$TMP_CRON"
+        ;;
+    prune)
+        prune_sets
+        echo "OK: retention applied ($(retention_of) newest sets kept)"
+        ;;
+    list)
+        for dir in $(ls -1 "$ROOT" 2>/dev/null | sort -r); do
+            [ -d "$ROOT/$dir" ] || continue
+            for f in "$ROOT/$dir"/*; do
+                [ -f "$f" ] || continue
+                printf '%s|%s|%s\n' "$dir" "$(basename "$f")" "$(stat -c%s "$f")"
+            done
+        done
+        ;;
+    cat)
+        [ $# -eq 3 ] || fail "usage: cat <dir> <file>"
+        path_of "$2" "$3"
+        cat "$P"
+        ;;
+    delete)
+        [ $# -eq 3 ] || fail "usage: delete <dir> <file>"
+        path_of "$2" "$3"
+        rm -f "$P"
+        echo "OK: $2/$3 deleted"
+        ;;
+    restore-db)
+        [ $# -eq 3 ] || fail "usage: restore-db <dir> <file>"
+        path_of "$2" "$3"
+        db="${P##*/}"; db="${db#db-}"; db="${db%.sql.gz}"
+        [[ "$db" =~ $NAME_RE ]] || fail "invalid database name derived from file"
+        gunzip -c "$P" | /usr/bin/mariadb "$db"
+        echo "OK: database $db restored from $2/$3"
+        ;;
+    restore-site)
+        [ $# -eq 3 ] || fail "usage: restore-site <dir> <file>"
+        path_of "$2" "$3"
+        domain="${P##*/}"; domain="${domain#site-}"; domain="${domain%.tar.gz}"
+        [[ "$domain" =~ $DOMAIN_RE ]] || fail "invalid domain derived from file"
+        tar xzf "$P" -C /var/www
+        SITE_USER="site-$(printf '%s' "$domain" | md5sum | cut -c1-8)"
+        if id -u "$SITE_USER" &>/dev/null; then
+            chown -R "$SITE_USER:$SITE_USER" "/var/www/$domain"
+        fi
+        echo "OK: site $domain restored from $2/$3"
+        ;;
+    *)
+        fail "unknown action: ${1:-empty}"
+        ;;
+esac

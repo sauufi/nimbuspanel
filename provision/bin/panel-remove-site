@@ -1,0 +1,111 @@
+#!/usr/bin/env bash
+# ============================================================
+# panel-remove-site — delete a site (vhosts, FPM pool, node app
+# unit, linux user). Invoked via sudo by user 'panel'; arguments
+# are validated strictly.
+#
+#   panel-remove-site <domain> [--purge] [<siteId>]
+#
+# Without --purge the site data is moved to /var/www/<domain>.removed-<ts>
+# (deletable by hand later). With --purge the data is destroyed.
+# siteId is required for node sites (to stop the app-<siteId> unit).
+# ============================================================
+set -euo pipefail
+
+DOMAIN_RE='^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$'
+
+DOMAIN="${1:-}"; PURGE=""; SITE_ID="${3:-}"
+
+usage() { echo "usage: panel-remove-site <domain> [--purge] [<siteId>]" >&2; exit 64; }
+fail()  { echo "panel-remove-site: $*" >&2; exit 1; }
+
+[ $# -ge 1 ] && [ $# -le 3 ] || usage
+DOMAIN="${DOMAIN,,}"
+[[ "$DOMAIN" =~ $DOMAIN_RE ]] || fail "invalid domain: $DOMAIN"
+case "${2:-}" in "" | --purge) PURGE="${2:-}" ;; *) usage ;; esac
+if [ -n "${SITE_ID}" ]; then
+    [[ "$SITE_ID" =~ ^[0-9]+$ ]] || fail "siteId must be numeric"
+fi
+
+SITE_ROOT="/var/www/$DOMAIN"
+VHOST="/etc/nginx/sites-available/$DOMAIN.conf"
+SITE_USER="site-$(printf '%s' "$DOMAIN" | md5sum | cut -c1-8)"
+
+# 1. Stop and remove the node app unit (app-<siteId>)
+if [ -n "$SITE_ID" ] && systemctl list-unit-files "app-$SITE_ID.service" --no-legend 2>/dev/null | grep -q .; then
+    systemctl disable --now "app-$SITE_ID" >/dev/null 2>&1 || true
+    rm -f "/etc/systemd/system/app-$SITE_ID.service"
+    systemctl daemon-reload
+fi
+
+# 2. Remove the FPM pool (all versions) + nginx vhost
+RELOAD_FPM=()
+for pool in /etc/php/*/fpm/pool.d/"$DOMAIN".conf; do
+    [ -f "$pool" ] || continue
+    # version = path segment right after /etc/php/ (e.g. "8.3")
+    ver="${pool#/etc/php/}"
+    ver="${ver%%/*}"
+    RELOAD_FPM+=("$ver")
+    rm -f "$pool"
+done
+
+rm -f "$VHOST" "/etc/nginx/sites-enabled/$DOMAIN.conf"
+
+# Custom nginx rules include if present
+rm -f "/etc/nginx/panel-rules/$DOMAIN.conf"
+
+# Apache vhost (.htaccess mode) if present
+if [ -d /etc/apache2/sites-enabled ]; then
+    rm -f "/etc/apache2/sites-enabled/$DOMAIN.conf" "/etc/apache2/sites-available/$DOMAIN.conf"
+    APACHE_RELOAD=1
+fi
+
+# 3. Make sure no process still belongs to the site user before
+#    userdel — userdel refuses while a process owns the user:
+#    - PHP-FPM workers → graceful reload of php*-fpm services
+#    - anything else (a stuck node app) → TERM, wait, then KILL
+if id -u "$SITE_USER" &>/dev/null && pgrep -u "$SITE_USER" >/dev/null 2>&1; then
+    for svc in $(systemctl list-units --type=service --state=running 'php*-fpm.service' --no-legend | awk '{print $1}'); do
+        systemctl reload "$svc"
+    done
+    for _ in 1 2 3; do
+        pgrep -u "$SITE_USER" >/dev/null 2>&1 || break
+        sleep 1
+    done
+    if pgrep -u "$SITE_USER" >/dev/null 2>&1; then
+        pkill -TERM -u "$SITE_USER" 2>/dev/null || true
+        sleep 2
+        pkill -KILL -u "$SITE_USER" 2>/dev/null || true
+    fi
+fi
+
+if id -u "$SITE_USER" &>/dev/null; then
+    # Vhosts/pools/data are already clean; a leftover nologin user is
+    # harmless (recreating the same site stays idempotent) — do not
+    # fail the whole removal because of it.
+    userdel "$SITE_USER" || echo "panel-remove-site: WARNING user $SITE_USER still has processes, skipped" >&2
+fi
+
+if [ -d "$SITE_ROOT" ]; then
+    if [ "$PURGE" = "--purge" ]; then
+        rm -rf "$SITE_ROOT"
+    else
+        mv "$SITE_ROOT" "${SITE_ROOT}.removed-$(date +%s)"
+    fi
+fi
+
+NGINX_ERR="$(mktemp)"
+if ! nginx -t >"$NGINX_ERR" 2>&1; then
+    cat "$NGINX_ERR" >&2
+    rm -f "$NGINX_ERR"
+    fail "nginx -t failed after removal — check manually"
+fi
+rm -f "$NGINX_ERR"
+
+systemctl reload nginx
+for v in "${RELOAD_FPM[@]}"; do
+    systemctl reload "php$v-fpm"
+done
+[ "${APACHE_RELOAD:-}" = "1" ] && systemctl reload apache2
+
+echo "OK: site $DOMAIN removed${PURGE:+ (data destroyed)}"

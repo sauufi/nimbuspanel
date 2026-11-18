@@ -1,0 +1,177 @@
+#!/usr/bin/env bash
+# ============================================================
+# panel-mail — manage virtual mail domains/mailboxes/aliases for
+# Postfix + Dovecot (flat texthash/passwd-file maps, no SQL).
+# Invoked via sudo by user 'panel'; all arguments validated strictly.
+# Mail lives in /var/mail/vhosts/<domain>/<localpart>/Maildir as the
+# vmail user. Passwords are hashed SHA512-CRYPT via doveadm.
+#
+#   panel-mail add-domain <domain>
+#   panel-mail del-domain <domain> [--purge]
+#   panel-mail add-mailbox <domain> <localpart> <password>
+#   panel-mail del-mailbox <domain> <localpart>
+#   panel-mail passwd <domain> <localpart> <password>
+#   panel-mail add-alias <domain> <alias-localpart> <target-address>
+#   panel-mail del-alias <domain> <alias-localpart>
+#   panel-mail list
+# ============================================================
+set -euo pipefail
+
+DOMAIN_RE='^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$'
+LOCAL_RE='^[a-z0-9][a-z0-9._-]{0,29}$'
+PASS_RE='^[A-Za-z0-9._@+-]{8,64}$'
+ADDR_RE='^[a-z0-9][a-z0-9._-]*@[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$'
+
+MAIL_DIR="/etc/panel-mail"
+VHOSTS="/var/mail/vhosts"
+
+fail() { echo "panel-mail: $*" >&2; exit 1; }
+
+VMAIL_UID="$(id -u vmail 2>/dev/null || true)"
+VMAIL_GID="$(id -g vmail 2>/dev/null || true)"
+[ -n "$VMAIL_UID" ] || fail "vmail user missing — run provisioning (mail step)"
+
+# users file dibaca worker auth dovecot — jaga kepemilikan/grup tiap kali
+chown root:dovecot "$MAIL_DIR/users" 2>/dev/null || true
+chmod 0640 "$MAIL_DIR/users"
+
+rewrite() { # $1=file, $2=grep -v pattern
+    local tmp
+    tmp="$(mktemp)"
+    grep -v "$2" "$1" > "$tmp" 2>/dev/null || true
+    cat "$tmp" > "$1"
+    rm -f "$tmp"
+}
+
+valid_domain() { [[ "$1" =~ $DOMAIN_RE ]] || fail "invalid domain: $1"; }
+valid_local()  { [[ "$1" =~ $LOCAL_RE ]] || fail "invalid local part: $1"; }
+valid_pass()   { [[ "$1" =~ $PASS_RE ]] || fail "invalid password (8-64; letters/digits/._@+-)"; }
+valid_addr()   { [[ "$1" =~ $ADDR_RE ]] || fail "invalid address: $1"; }
+
+ACTION="${1:-}"
+
+case "$ACTION" in
+    add-domain)
+        [ $# -eq 2 ] || fail "usage: add-domain <domain>"
+        D="${2,,}"; valid_domain "$D"
+        grep -q "^$D " "$MAIL_DIR/domains" 2>/dev/null && fail "domain already exists"
+        echo "$D OK" >> "$MAIL_DIR/domains"
+        postfix reload >/dev/null 2>&1
+        echo "OK: mail domain $D added"
+        ;;
+    del-domain)
+        [ $# -ge 2 ] && [ $# -le 3 ] || fail "usage: del-domain <domain> [--purge]"
+        D="${2,,}"; valid_domain "$D"
+        [ "${3:-}" = "--purge" ] || [ -z "${3:-}" ] || fail "usage: del-domain <domain> [--purge]"
+        rewrite "$MAIL_DIR/domains" "^$D "
+        rewrite "$MAIL_DIR/mailboxes" "@$D "
+        rewrite "$MAIL_DIR/aliases" "@$D "
+        rewrite "$MAIL_DIR/users" "@$D:"
+        [ "${3:-}" = "--purge" ] && rm -rf "$VHOSTS/$D"
+        postfix reload >/dev/null 2>&1
+        echo "OK: mail domain $D removed${3:+ (data destroyed)}"
+        ;;
+    add-mailbox)
+        [ $# -eq 4 ] || fail "usage: add-mailbox <domain> <localpart> <password>"
+        D="${2,,}"; L="$3"; P="$4"
+        valid_domain "$D"; valid_local "$L"; valid_pass "$P"
+        grep -q "^$D " "$MAIL_DIR/domains" 2>/dev/null || fail "add the domain first"
+        grep -q "^$L@$D " "$MAIL_DIR/mailboxes" 2>/dev/null && fail "mailbox already exists"
+        HASH="$(doveadm pw -s SHA512-CRYPT -p "$P")"
+        echo "$L@$D $D/$L/Maildir/" >> "$MAIL_DIR/mailboxes"
+        echo "$L@$D:$HASH:$VMAIL_UID:$VMAIL_GID::/var/mail/vhosts/$D/$L" >> "$MAIL_DIR/users"
+        runuser -u vmail -- mkdir -p "$VHOSTS/$D/$L/Maildir/new" "$VHOSTS/$D/$L/Maildir/cur" "$VHOSTS/$D/$L/Maildir/tmp"
+        postfix reload >/dev/null 2>&1
+        echo "OK: mailbox $L@$D created"
+        ;;
+    del-mailbox)
+        [ $# -eq 3 ] || fail "usage: del-mailbox <domain> <localpart>"
+        D="${2,,}"; L="$3"; valid_domain "$D"; valid_local "$L"
+        grep -q "^$L@$D " "$MAIL_DIR/mailboxes" 2>/dev/null || fail "mailbox not found"
+        rewrite "$MAIL_DIR/mailboxes" "^$L@$D "
+        rewrite "$MAIL_DIR/users" "^$L@$D:"
+        rewrite "$MAIL_DIR/aliases" " $L@$D$"
+        rm -rf "$VHOSTS/$D/$L"
+        postfix reload >/dev/null 2>&1
+        echo "OK: mailbox $L@$D removed (mail destroyed)"
+        ;;
+    passwd)
+        [ $# -eq 4 ] || fail "usage: passwd <domain> <localpart> <password>"
+        D="${2,,}"; L="$3"; P="$4"
+        valid_domain "$D"; valid_local "$L"; valid_pass "$P"
+        grep -q "^$L@$D:" "$MAIL_DIR/users" 2>/dev/null || fail "mailbox not found"
+        HASH="$(doveadm pw -s SHA512-CRYPT -p "$P")"
+        rewrite "$MAIL_DIR/users" "^$L@$D:"
+        echo "$L@$D:$HASH:$VMAIL_UID:$VMAIL_GID::/var/mail/vhosts/$D/$L" >> "$MAIL_DIR/users"
+        echo "OK: password for $L@$D changed"
+        ;;
+    add-alias)
+        [ $# -eq 4 ] || fail "usage: add-alias <domain> <alias-localpart> <target-address>"
+        D="${2,,}"; A="$3"; T="${4,,}"
+        valid_domain "$D"; valid_local "$A"; valid_addr "$T"
+        grep -q "^$A@$D " "$MAIL_DIR/aliases" 2>/dev/null && fail "alias already exists"
+        echo "$A@$D $T" >> "$MAIL_DIR/aliases"
+        postfix reload >/dev/null 2>&1
+        echo "OK: alias $A@$D → $T"
+        ;;
+    del-alias)
+        [ $# -eq 3 ] || fail "usage: del-alias <domain> <alias-localpart>"
+        D="${2,,}"; A="$3"; valid_domain "$D"; valid_local "$A"
+        rewrite "$MAIL_DIR/aliases" "^$A@$D "
+        postfix reload >/dev/null 2>&1
+        echo "OK: alias $A@$D removed"
+        ;;
+    dkim-record)
+        [ $# -eq 2 ] || fail "usage: dkim-record <domain>"
+        D="${2,,}"; valid_domain "$D"
+        [ -f "/etc/opendkim/keys/$D/mail.txt" ] || fail "no DKIM keys for $D"
+        tr -d '\n"' < "/etc/opendkim/keys/$D/mail.txt" | sed 's/[()]//g; s/[[:space:]]\+/ /g'
+        ;;
+    gen-dkim)
+        [ $# -eq 2 ] || fail "usage: gen-dkim <domain>"
+        D="${2,,}"; valid_domain "$D"
+        command -v opendkim-genkey >/dev/null 2>&1 || fail "opendkim not installed — run provisioning (dkim step)"
+        if [ -f "/etc/opendkim/keys/$D/mail.private" ]; then
+            fail "DKIM keys for $D already exist (delete first to rotate)"
+        fi
+        grep -q "^$D " "$MAIL_DIR/domains" 2>/dev/null || fail "add the mail domain first"
+        mkdir -p "/etc/opendkim/keys/$D"
+        opendkim-genkey -b 2048 -D "/etc/opendkim/keys/$D" -d "$D" -s mail -v >/dev/null 2>&1
+        chown -R opendkim:opendkim "/etc/opendkim/keys/$D"
+        chmod 0750 "/etc/opendkim/keys/$D"
+        chmod 0600 "/etc/opendkim/keys/$D/mail.private"
+        # gabungkan mail.txt (multi-string) menjadi satu nilai TXT
+        RECORD="$(tr -d '\n"' < "/etc/opendkim/keys/$D/mail.txt" | sed 's/[()]//g; s/[[:space:]]\+/ /g')"
+        grep -v "^mail._domainkey.$D " /etc/opendkim/KeyTable > /tmp/kt.$$ 2>/dev/null || true
+        cat /tmp/kt.$$ > /etc/opendkim/KeyTable; rm -f /tmp/kt.$$
+        echo "mail._domainkey.$D $D:mail:/etc/opendkim/keys/$D/mail.private" >> /etc/opendkim/KeyTable
+        grep -v " @$D\$" /etc/opendkim/SigningTable > /tmp/st.$$ 2>/dev/null || true
+        cat /tmp/st.$$ > /etc/opendkim/SigningTable; rm -f /tmp/st.$$
+        echo "*@$D mail._domainkey.$D" >> /etc/opendkim/SigningTable
+        chown opendkim:opendkim /etc/opendkim/KeyTable /etc/opendkim/SigningTable
+        systemctl restart opendkim >/dev/null 2>&1
+        echo "OK: DKIM keys generated for $D"
+        echo "DKIM-RECORD: $RECORD"
+        ;;
+    del-dkim)
+        [ $# -eq 2 ] || fail "usage: del-dkim <domain>"
+        D="${2,,}"; valid_domain "$D"
+        rm -rf "/etc/opendkim/keys/$D"
+        rewrite /etc/opendkim/KeyTable "mail._domainkey.$D "
+        rewrite /etc/opendkim/SigningTable " @$D\$"
+        systemctl restart opendkim >/dev/null 2>&1 || true
+        echo "OK: DKIM keys removed for $D"
+        ;;
+    list)
+        [ -f "$MAIL_DIR/domains" ] && awk '{print "domain " $1}' "$MAIL_DIR/domains"
+        [ -f "$MAIL_DIR/mailboxes" ] && awk '{print "mailbox " $1}' "$MAIL_DIR/mailboxes"
+        [ -f "$MAIL_DIR/aliases" ] && awk '{print "alias " $1 " -> " $2}' "$MAIL_DIR/aliases"
+        for kd in /etc/opendkim/keys/*/; do
+            [ -f "$kd/mail.private" ] || continue
+            echo "dkim $(basename "$kd")"
+        done
+        ;;
+    *)
+        fail "unknown action: ${ACTION:-empty}"
+        ;;
+esac

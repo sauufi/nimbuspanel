@@ -1,0 +1,139 @@
+#!/usr/bin/env bash
+# ============================================================
+# panel-node-deploy — deploy a Node.js application for one site.
+# Invoked via sudo by user 'panel'; all arguments are validated.
+#
+#   panel-node-deploy <domain> <siteId> <repo> <branch> <nodeVer> <buildCmd> <startCmd> <port>
+#
+# Flow: git fetch/checkout → build into releases/<ts> → flip the
+#       current symlink → write the app-<siteId> systemd unit →
+#       restart → health check. On health check failure the previous
+#       release is restored automatically.
+# git and the build run as the SITE USER (not root); root only
+# writes the unit, the symlink, and manages systemd. Private SSH
+# keys are not supported yet (public https repos or local paths).
+# ============================================================
+set -euo pipefail
+
+DOMAIN_RE='^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$'
+BRANCH_RE='^[a-zA-Z0-9._/-]+$'
+CMD_RE='^[a-zA-Z0-9 ./_:=@-]*$'          # build/start charset: no ; | & $ ` >
+REPO_RE='^(https://[a-zA-Z0-9./_:~@-]+|/[a-zA-Z0-9./_-]+)$'
+
+DOMAIN="${1:-}"; SITE_ID="${2:-}"; REPO="${3:-}"; BRANCH="${4:-}"
+NVER="${5:-}"; BUILD="${6:-}"; START="${7:-}"; PORT="${8:-}"
+
+usage() { echo "usage: panel-node-deploy <domain> <siteId> <repo> <branch> <nodeVer> <buildCmd> <startCmd> <port>" >&2; exit 64; }
+fail()  { echo "panel-node-deploy: $*" >&2; exit 1; }
+
+[ $# -eq 8 ] || usage
+DOMAIN="${DOMAIN,,}"
+[[ "$DOMAIN" =~ $DOMAIN_RE ]] || fail "invalid domain: $DOMAIN"
+[[ "$SITE_ID" =~ ^[0-9]+$ ]] || fail "siteId must be numeric"
+[[ "$REPO" =~ $REPO_RE ]] || fail "invalid repo: $REPO"
+[[ "$BRANCH" =~ $BRANCH_RE ]] || fail "invalid branch: $BRANCH"
+[[ "$NVER" =~ ^[0-9]+$ ]] || fail "invalid node version: $NVER"
+[[ "$BUILD" =~ $CMD_RE ]] || fail "buildCmd contains forbidden characters"
+[[ "$START" =~ $CMD_RE ]] || [ -z "$START" ] || fail "startCmd contains forbidden characters"
+[ -n "$START" ] || fail "startCmd is required"
+[[ "$PORT" =~ ^[0-9]{5}$ ]] && [ "$PORT" -ge 30000 ] && [ "$PORT" -le 39999 ] || fail "invalid port: $PORT"
+[[ "$REPO" != *".."* ]] || fail "repo contains '..'"
+
+NODEBIN="/opt/node/v$NVER/bin"
+[ -x "$NODEBIN/node" ] || fail "Node v$NVER is not installed at $NODEBIN"
+
+SITE_ROOT="/var/www/$DOMAIN"
+SITE_USER="site-$(printf '%s' "$DOMAIN" | md5sum | cut -c1-8)"
+id -u "$SITE_USER" &>/dev/null || fail "site not created yet in the panel (user $SITE_USER missing)"
+
+mkdir -p "$SITE_ROOT"/{repo,releases,shared,logs}
+chown -R "$SITE_USER:$SITE_USER" "$SITE_ROOT"
+
+# All git/build operations run as the site user, with the chosen node in PATH
+RUN() { runuser -u "$SITE_USER" -- env PATH="$NODEBIN:$PATH" "$@"; }
+
+echo "[1/6] Fetching code (repo: $REPO, branch: $BRANCH)..."
+if [ ! -d "$SITE_ROOT/repo/.git" ]; then
+    RUN git clone "$REPO" "$SITE_ROOT/repo" >/dev/null 2>&1 || fail "git clone failed (public repo/valid path?)"
+fi
+RUN git -C "$SITE_ROOT/repo" fetch origin --prune >/dev/null 2>&1 || fail "git fetch failed"
+RUN git -C "$SITE_ROOT/repo" checkout -f "$BRANCH" >/dev/null 2>&1 || fail "branch $BRANCH not found"
+RUN git -C "$SITE_ROOT/repo" reset --hard "origin/$BRANCH" >/dev/null 2>&1 \
+    || RUN git -C "$SITE_ROOT/repo" reset --hard "$BRANCH" >/dev/null 2>&1 \
+    || fail "failed to reset to branch"
+
+echo "[2/6] Building new release..."
+TS="$(date +%Y%m%d-%H%M%S)"
+REL="$SITE_ROOT/releases/$TS"
+mkdir -p "$REL"
+chown "$SITE_USER:$SITE_USER" "$REL"
+RUN cp -a "$SITE_ROOT/repo/." "$REL/"
+# install deps + optional build + strip devDependencies after build
+RUN bash -c "cd '$REL' && [ -f package.json ] || { echo 'package.json not found in repo' >&2; exit 1; }
+npm install --no-audit --no-fund 2>&1 | tail -2
+${BUILD:+$BUILD
+}
+npm prune --omit=dev" || fail "build failed"
+RUN ln -sfn ../shared/.env "$REL/.env"
+
+echo "[3/6] Installing systemd unit app-$SITE_ID..."
+# Map the first startCmd token to the absolute binary of the chosen node version
+first_tok="${START%% *}"; rest="${START#"$first_tok"}"; rest="${rest#"${rest%%[! ]*}"}"
+case "$first_tok" in
+    node | npm | npx | yarn | pnpm) EXEC="$NODEBIN/$first_tok $rest" ;;
+    /*) EXEC="$START" ;;
+    *) fail "startCmd must start with 'node'/'npm'/... or an absolute path" ;;
+esac
+
+UNIT="/etc/systemd/system/app-$SITE_ID.service"
+cat > "$UNIT" <<EOF
+# managed by panel — do not edit by hand
+[Unit]
+Description=app-$SITE_ID ($DOMAIN) - managed by panel
+After=network.target
+
+[Service]
+User=$SITE_USER
+Group=$SITE_USER
+WorkingDirectory=$SITE_ROOT/current
+Environment=NODE_ENV=production
+Environment=PORT=$PORT
+EnvironmentFile=-$SITE_ROOT/shared/.env
+ExecStart=$EXEC
+Restart=always
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
+EOF
+systemctl daemon-reload
+systemctl enable "app-$SITE_ID" >/dev/null
+
+echo "[4/6] Activating release $TS..."
+PREV="$(readlink "$SITE_ROOT/current" 2>/dev/null || true)"
+ln -sfn "$REL" "$SITE_ROOT/current"
+systemctl restart "app-$SITE_ID"
+
+echo "[5/6] Health check on 127.0.0.1:$PORT (max 45s)..."
+ok=""
+for _ in $(seq 1 45); do
+    sleep 1
+    if curl -s -o /dev/null --max-time 2 "http://127.0.0.1:$PORT/"; then ok=1; break; fi
+done
+if [ -z "$ok" ]; then
+    echo "HEALTH CHECK FAILED — application is not responding on port $PORT" >&2
+    if [ -n "$PREV" ]; then
+        echo "Rolling back to previous release: $PREV" >&2
+        ln -sfn "$PREV" "$SITE_ROOT/current"
+        systemctl restart "app-$SITE_ID"
+    fi
+    exit 1
+fi
+
+echo "[6/6] Pruning old releases (keeping 5)..."
+cd "$SITE_ROOT/releases"
+ls -1 | sort | head -n -5 | while read -r old; do rm -rf "$SITE_ROOT/releases/$old"; done
+
+echo "OK: $DOMAIN deployed (release $TS, unit app-$SITE_ID active)"

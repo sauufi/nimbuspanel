@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# panel-read-env — print the contents of /var/www/<domain>/shared/.env.
+#   sudo panel-read-env <domain>
+set -euo pipefail
+
+DOMAIN_RE='^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$'
+DOMAIN="${1:-}"
+
+[ $# -eq 1 ] || { echo "usage: panel-read-env <domain>" >&2; exit 64; }
+DOMAIN="${DOMAIN,,}"
+[[ "$DOMAIN" =~ $DOMAIN_RE ]] || { echo "panel-read-env: invalid domain" >&2; exit 64; }
+
+SITE_USER="site-$(printf '%s' "$DOMAIN" | md5sum | cut -c1-8)"
+id -u "$SITE_USER" &>/dev/null || { echo "panel-read-env: site does not exist" >&2; exit 66; }
+
+F="/var/www/$DOMAIN/shared/.env"
+if [ -f "$F" ]; then
+    cat "$F"
+else
+    echo "# (no .env yet)"
+fi

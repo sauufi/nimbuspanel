@@ -1,0 +1,154 @@
+#!/usr/bin/env bash
+# ============================================================
+# panel-install-webmail — install SnappyMail (lightweight PHP
+# webmail), preset to this mail server.
+#   sudo panel-install-webmail panel        → https://<panel-host>/webmail
+#   sudo panel-install-webmail <domain>     → https://<domain>/webmail
+# The "panel" target serves webmail directly on the panel's own
+# domain: dedicated docroot + PHP-FPM pool + a managed location
+# block inside the panel nginx vhost (validated with nginx -t).
+# ============================================================
+set -euo pipefail
+
+DOMAIN_RE='^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$'
+TARGET="${1:-}"
+
+[ $# -eq 1 ] || { echo "usage: panel-install-webmail <domain|panel>" >&2; exit 64; }
+
+MAILHOST="$(hostname -f 2>/dev/null || hostname)"
+
+fetch_latest() {
+    URL="$(curl -fsSL --max-time 20 https://api.github.com/repos/the-djmaze/snappymail/releases/latest \
+        | grep -o '"browser_download_url": *"[^"]*snappymail-[0-9.]*\.zip"' | head -1 | grep -o 'https[^"]*')"
+    [ -n "$URL" ] || { echo "panel-install-webmail: could not resolve the SnappyMail release URL" >&2; return 1; }
+}
+
+preset_ini() { # $1 = DEST
+    local INI="$1/_data_/_data_/default/application.ini"
+    mkdir -p "$(dirname "$INI")"
+    cat > "$INI" <<EOF
+; managed by panel — webmail presets
+[defaults]
+imap_host = "tls://$MAILHOST:143"
+smtp_host = "tls://$MAILHOST:587"
+smtp_auth = On
+EOF
+}
+
+if [ "$TARGET" = "panel" ]; then
+    DOCROOT="/var/www/panel-webmail/htdocs"
+    DEST="$DOCROOT/webmail"
+    [ -e "$DEST" ] && { echo "panel-install-webmail: $DEST already exists" >&2; exit 73; }
+
+    # newest installed PHP version
+    PV="$(ls /etc/php 2>/dev/null | sort -V | tail -1)"
+    [[ "$PV" =~ ^[0-9]+\.[0-9]+$ ]] || { echo "panel-install-webmail: no PHP installed" >&2; exit 1; }
+
+    fetch_latest
+    TMP="$(mktemp -d)"
+    trap 'rm -rf "$TMP"' EXIT
+    curl -fsSL --retry 3 "$URL" -o "$TMP/webmail.zip"
+    unzip -q "$TMP/webmail.zip" -d "$TMP/extract"
+
+    mkdir -p "$DOCROOT"
+    mv "$TMP/extract" "$DEST"
+    preset_ini "$DEST"
+    chown -R www-data:www-data "$DEST"
+
+    # dedicated FPM pool (small — webmail only)
+    cat > "/etc/php/$PV/fpm/pool.d/panel-webmail.conf" <<EOF
+; managed by panel — webmail on the panel domain
+[panel-webmail]
+user = www-data
+group = www-data
+listen = /run/php/php$PV-fpm-panel-webmail.sock
+listen.acl_users = www-data
+pm = dynamic
+pm.max_children = 4
+pm.start_servers = 1
+pm.min_spare_servers = 1
+pm.max_spare_servers = 2
+php_admin_value[error_log] = /var/log/panel-webmail-php.log
+php_admin_flag[log_errors] = on
+EOF
+
+    # managed location inside the panel vhost (443 block; the 80 block
+    # keeps its global redirect to https). Skip when panel-hostname
+    # already rendered the block.
+    PANELVHOST="/etc/nginx/sites-available/panel.conf"
+    [ -f "$PANELVHOST" ] || { rm -f "/etc/php/$PV/fpm/pool.d/panel-webmail.conf"; echo "panel-install-webmail: panel vhost not found at $PANELVHOST" >&2; exit 1; }
+    if grep -q "location \^~ /webmail" "$PANELVHOST"; then
+        rm -f "/etc/php/$PV/fpm/pool.d/panel-webmail.conf.duplicate" 2>/dev/null || true
+        systemctl reload "php$PV-fpm" 2>/dev/null || true
+        echo "OK: webmail installed at https://$MAILHOST/webmail (location already present)"
+        exit 0
+    fi
+    BACKUP="$(mktemp)"
+    cp -a "$PANELVHOST" "$BACKUP"
+    BLOCK="$(mktemp)"
+    cat > "$BLOCK" <<EOF
+
+    # BEGIN PANEL WEBMAIL
+    location ^~ /webmail {
+        root $DOCROOT;
+        index index.php;
+        location ~ \.php\$ {
+            include snippets/fastcgi-php.conf;
+            fastcgi_pass unix:/run/php/php$PV-fpm-panel-webmail.sock;
+        }
+    }
+    # END PANEL WEBMAIL
+EOF
+    # hapus blok lama lalu sisipkan setelah baris ssl_protocols (blok 443)
+    awk -v bf="$BLOCK" '
+        /^# BEGIN PANEL WEBMAIL$/ { skip = 1 }
+        !skip { print }
+        /^# END PANEL WEBMAIL$/ { skip = 0 }
+        /^    ssl_protocols/ && !done {
+            while ((getline line < bf) > 0) print line
+            close(bf)
+            done = 1
+        }
+    ' "$PANELVHOST" > "$PANELVHOST.new"
+    mv "$PANELVHOST.new" "$PANELVHOST"
+
+    if ! nginx -t >/dev/null 2>&1; then
+        cp -a "$BACKUP" "$PANELVHOST"
+        rm -f "/etc/php/$PV/fpm/pool.d/panel-webmail.conf"
+        nginx -t 2>&1 | head -5 >&2
+        echo "panel-install-webmail: invalid nginx config — rolled back" >&2
+        exit 1
+    fi
+    systemctl reload "php$PV-fpm"
+    systemctl reload nginx
+    echo "OK: webmail installed at https://$MAILHOST/webmail (PHP $PV pool)"
+    exit 0
+fi
+
+# ---- target: PHP site docroot ----
+DOMAIN="${TARGET,,}"
+[[ "$DOMAIN" =~ $DOMAIN_RE ]] || { echo "panel-install-webmail: invalid domain" >&2; exit 64; }
+
+SITE_ROOT="/var/www/$DOMAIN"
+SITE_USER="site-$(printf '%s' "$DOMAIN" | md5sum | cut -c1-8)"
+id -u "$SITE_USER" &>/dev/null || { echo "panel-install-webmail: site does not exist" >&2; exit 66; }
+[ -d "$SITE_ROOT/htdocs" ] || { echo "panel-install-webmail: docroot missing" >&2; exit 66; }
+
+DEST="$SITE_ROOT/htdocs/webmail"
+[ -e "$DEST" ] && { echo "panel-install-webmail: $DEST already exists" >&2; exit 73; }
+
+fetch_latest
+TMP="$(mktemp -d)"
+trap 'rm -rf "$TMP"' EXIT
+# site user harus bisa memindahkan folder hasil ekstrak dari sini
+chown "$SITE_USER:$SITE_USER" "$TMP"
+chmod 0755 "$TMP"
+curl -fsSL --retry 3 "$URL" -o "$TMP/webmail.zip"
+unzip -q "$TMP/webmail.zip" -d "$TMP/extract"
+chown -R "$SITE_USER:$SITE_USER" "$TMP/extract"
+runuser -u "$SITE_USER" -- mv "$TMP/extract" "$DEST"
+
+preset_ini "$DEST"
+chown -R "$SITE_USER:$SITE_USER" "$DEST/_data_"
+
+echo "OK: /webmail installed on $DOMAIN (preset mail host: $MAILHOST)"

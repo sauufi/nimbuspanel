@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+# ============================================================
+# panel-install-adminer — drop a random-named Adminer into a site's
+# docroot. Invoked via sudo by user 'panel'.
+#   sudo panel-install-adminer <domain>
+# The random filename keeps it from being found by opportunistic
+# scanners; delete the file when you are done using it.
+# ============================================================
+set -euo pipefail
+
+DOMAIN_RE='^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$'
+ADMINER_URL="https://github.com/vrana/adminer/releases/download/v4.8.1/adminer-4.8.1.php"
+
+DOMAIN="${1:-}"
+
+[ $# -eq 1 ] || { echo "usage: panel-install-adminer <domain>" >&2; exit 64; }
+DOMAIN="${DOMAIN,,}"
+[[ "$DOMAIN" =~ $DOMAIN_RE ]] || { echo "panel-install-adminer: invalid domain" >&2; exit 64; }
+
+SITE_ROOT="/var/www/$DOMAIN"
+SITE_USER="site-$(printf '%s' "$DOMAIN" | md5sum | cut -c1-8)"
+id -u "$SITE_USER" &>/dev/null || { echo "panel-install-adminer: site does not exist" >&2; exit 66; }
+[ -d "$SITE_ROOT/htdocs" ] || { echo "panel-install-adminer: docroot missing" >&2; exit 66; }
+
+# openssl rand: aman dari SIGPIPE (beda dgn tr|head di bawah pipefail)
+SUF="$(openssl rand -hex 5)"
+TMP="$(mktemp)"
+trap 'rm -f "$TMP"' EXIT
+curl -fsSL --retry 3 "$ADMINER_URL" -o "$TMP"
+
+DEST="$SITE_ROOT/htdocs/adminer-$SUF.php"
+install -m 0644 -o "$SITE_USER" -g "$SITE_USER" "$TMP" "$DEST"
+
+echo "OK: /adminer-$SUF.php installed on $DOMAIN (delete the file when finished)"

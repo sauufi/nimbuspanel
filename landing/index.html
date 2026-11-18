@@ -1,0 +1,239 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="description" content="NimbusPanel — The lightweight hosting control panel for PHP and Node.js. Native performance, zero Docker overhead.">
+<title>NimbusPanel — Lightweight Hosting Control Panel</title>
+<style>
+  :root {
+    --emerald: #059669; --emerald-light: #d1fae5; --emerald-dark: #047857;
+    --slate-900: #0f172a; --slate-800: #1e293b; --slate-700: #334155;
+    --slate-600: #475569; --slate-400: #94a3b8; --slate-200: #e2e8f0;
+    --slate-100: #f1f5f9; --slate-50: #f8fafc; --white: #ffffff;
+    --sky: #0ea5e9; --amber: #f59e0b; --red: #ef4444;
+  }
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; color:var(--slate-700); line-height:1.6; }
+  .container { max-width:1100px; margin:0 auto; padding:0 24px; }
+
+  /* Hero */
+  .hero { background:var(--slate-900); color:var(--white); padding:100px 0 80px; text-align:center; }
+  .hero h1 { font-size:3.2rem; font-weight:800; letter-spacing:-0.03em; margin-bottom:16px; }
+  .hero h1 span { color:var(--emerald); }
+  .hero p { font-size:1.25rem; color:var(--slate-400); max-width:600px; margin:0 auto 36px; }
+  .hero .badge { display:inline-flex; align-items:center; gap:6px; background:rgba(5,150,105,.15); color:var(--emerald); font-size:.8rem; font-weight:600; padding:6px 14px; border-radius:99px; margin-bottom:24px; }
+  .cta-group { display:flex; gap:16px; justify-content:center; flex-wrap:wrap; }
+  .btn-primary { background:var(--emerald); color:var(--white); font-weight:600; padding:14px 32px; border-radius:10px; text-decoration:none; font-size:1rem; transition:.2s; display:inline-flex; align-items:center; gap:8px; }
+  .btn-primary:hover { background:#059669e0; transform:translateY(-1px); }
+  .btn-secondary { background:transparent; color:var(--white); font-weight:500; padding:14px 32px; border-radius:10px; text-decoration:none; font-size:1rem; border:1px solid var(--slate-700); transition:.2s; }
+  .btn-secondary:hover { border-color:var(--slate-400); background:rgba(255,255,255,.05); }
+  .stats { display:flex; gap:48px; justify-content:center; margin-top:56px; flex-wrap:wrap; }
+  .stat { text-align:center; }
+  .stat .num { font-size:2.2rem; font-weight:700; color:var(--emerald); }
+  .stat .label { font-size:.8rem; color:var(--slate-400); text-transform:uppercase; letter-spacing:.05em; }
+
+  /* Features */
+  .features { padding:80px 0; background:var(--white); }
+  .features h2 { text-align:center; font-size:2rem; font-weight:700; color:var(--slate-900); margin-bottom:12px; }
+  .features .sub { text-align:center; color:var(--slate-600); font-size:1.05rem; margin-bottom:56px; }
+  .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(300px,1fr)); gap:24px; }
+  .card { background:var(--slate-50); border:1px solid var(--slate-200); border-radius:16px; padding:28px; transition:.2s; }
+  .card:hover { border-color:var(--emerald); box-shadow:0 4px 16px rgba(5,150,105,.08); }
+  .card .icon { width:48px; height:48px; border-radius:12px; background:var(--emerald-light); display:flex; align-items:center; justify-content:center; font-size:1.3rem; margin-bottom:16px; }
+  .card h3 { font-size:1.1rem; font-weight:600; color:var(--slate-900); margin-bottom:8px; }
+  .card p { font-size:.9rem; color:var(--slate-600); }
+
+  /* Code block */
+  .install { padding:80px 0; background:var(--slate-900); }
+  .install h2 { text-align:center; font-size:2rem; color:var(--white); margin-bottom:12px; }
+  .install .sub { text-align:center; color:var(--slate-400); margin-bottom:40px; }
+  .code-block { max-width:620px; margin:0 auto; background:var(--slate-800); border:1px solid var(--slate-700); border-radius:12px; overflow:hidden; }
+  .code-header { display:flex; align-items:center; gap:8px; padding:12px 16px; border-bottom:1px solid var(--slate-700); }
+  .code-header .dot { width:10px; height:10px; border-radius:50%; }
+  .code-header .dot.red { background:var(--red); } .code-header .dot.amber { background:var(--amber); } .code-header .dot.green { background:var(--emerald); }
+  .code-header span { margin-left:auto; font-size:.75rem; color:var(--slate-400); font-family:monospace; }
+  .code-body { padding:20px; font-family:'SF Mono',Fira Code,monospace; font-size:.85rem; color:#a5f3fc; line-height:1.8; }
+  .code-body .cmd { color:var(--emerald); }
+  .code-body .comment { color:var(--slate-400); }
+  .code-body .output { color:var(--slate-400); }
+
+  /* Comparison */
+  .compare { padding:80px 0; background:var(--white); }
+  .compare h2 { text-align:center; font-size:2rem; color:var(--slate-900); margin-bottom:12px; }
+  .compare .sub { text-align:center; color:var(--slate-600); margin-bottom:40px; }
+  table { width:100%; border-collapse:collapse; }
+  th { text-align:left; padding:14px 16px; background:var(--slate-100); font-size:.8rem; text-transform:uppercase; letter-spacing:.05em; color:var(--slate-600); border-bottom:2px solid var(--slate-200); }
+  th:first-child { border-radius:8px 0 0 0; } th:last-child { border-radius:0 8px 0 0; }
+  td { padding:14px 16px; border-bottom:1px solid var(--slate-200); font-size:.9rem; }
+  .yes { color:var(--emerald); font-weight:600; } .no { color:var(--slate-400); }
+
+  /* CTA */
+  .cta { padding:80px 0; background:var(--emerald); text-align:center; }
+  .cta h2 { font-size:2rem; color:var(--white); margin-bottom:12px; }
+  .cta p { color:var(--emerald-light); margin-bottom:32px; font-size:1.1rem; }
+
+  /* Footer */
+  .footer { background:var(--slate-900); color:var(--slate-400); padding:40px 0; text-align:center; font-size:.85rem; }
+  .footer a { color:var(--slate-400); text-decoration:none; } .footer a:hover { color:var(--white); }
+  .footer .links { display:flex; gap:24px; justify-content:center; margin-bottom:16px; }
+
+  @media(max-width:768px) {
+    .hero h1 { font-size:2.2rem; }
+    .hero p { font-size:1rem; }
+    .stats { gap:24px; }
+  }
+</style>
+</head>
+<body>
+
+<!-- Hero -->
+<section class="hero">
+  <div class="container">
+    <div class="badge">☁️ Open Source · v1.0</div>
+    <h1>Nimbus<span>Panel</span></h1>
+    <p>The lightweight hosting control panel for PHP &amp; Node.js.<br>Native performance. Zero Docker overhead. Runs on 1GB RAM.</p>
+    <div class="cta-group">
+      <a href="#install" class="btn-primary">Get Started →</a>
+      <a href="https://github.com/youruser/nimbuspanel" class="btn-secondary">⭐ GitHub</a>
+    </div>
+    <div class="stats">
+      <div class="stat"><div class="num">848MB</div><div class="label">Min RAM</div></div>
+      <div class="stat"><div class="num">3GB</div><div class="label">Min Disk</div></div>
+      <div class="stat"><div class="num">0</div><div class="label">Docker Needed</div></div>
+      <div class="stat"><div class="num">&lt;5min</div><div class="label">Setup Time</div></div>
+    </div>
+  </div>
+</section>
+
+<!-- Features -->
+<section class="features" id="features">
+  <div class="container">
+    <h2>Everything you need, nothing you don't</h2>
+    <p class="sub">Built for developers who want control without complexity</p>
+    <div class="grid">
+      <div class="card">
+        <div class="icon">🌐</div>
+        <h3>PHP + Node.js Hosting</h3>
+        <p>Multi-version PHP (7.4–8.4) with per-site FPM pools. Node.js with git-based deploy pipeline, releases, health checks &amp; auto-rollback.</p>
+      </div>
+      <div class="card">
+        <div class="icon">🔐</div>
+        <h3>Free SSL, Automatically</h3>
+        <p>Let's Encrypt certificates issued and renewed automatically. One click per site. HTTPS everywhere by default.</p>
+      </div>
+      <div class="card">
+        <div class="icon">📁</div>
+        <h3>Built-in File Manager</h3>
+        <p>Browse, edit, upload and manage files directly from the browser. Full CRUD with a clean code editor. No FTP client needed.</p>
+      </div>
+      <div class="card">
+        <div class="icon">✉️</div>
+        <h3>Email + Webmail</h3>
+        <p>Postfix + Dovecot + SnappyMail. Domain management, mailboxes, aliases, DKIM signing. Lightweight webmail included.</p>
+      </div>
+      <div class="card">
+        <div class="icon">🔄</div>
+        <h3>Git Auto-Deploy</h3>
+        <p>Push to deploy. Webhook triggers build → release → health check. Rollback with one click if something breaks.</p>
+      </div>
+      <div class="card">
+        <div class="icon">📦</div>
+        <h3>Smart Backups</h3>
+        <p>Scheduled backups with configurable scope (sites only, databases only, or everything). Retention policy. One-click restore.</p>
+      </div>
+      <div class="card">
+        <div class="icon">🗄</div>
+        <h3>Database Management</h3>
+        <p>Create MariaDB databases, import/export SQL, manage users and passwords. One-click Adminer for advanced needs.</p>
+      </div>
+      <div class="card">
+        <div class="icon">📜</div>
+        <h3>.htaccess Compatible</h3>
+        <p>Choose nginx for speed or Apache mode for .htaccess compatibility. Built-in converter for migrating existing rules.</p>
+      </div>
+      <div class="card">
+        <div class="icon">🛡</div>
+        <h3>Security First</h3>
+        <p>Per-site Linux users, scrypt password hashing, optional TOTP 2FA, sudo whitelist architecture, audit logging.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- Install -->
+<section class="install" id="install">
+  <div class="container">
+    <h2>Up and running in 5 minutes</h2>
+    <p class="sub">One script. Fresh Ubuntu 24.04 or Debian 12. Done.</p>
+    <div class="code-block">
+      <div class="code-header">
+        <div class="dot red"></div><div class="dot amber"></div><div class="dot green"></div>
+        <span>terminal</span>
+      </div>
+      <div class="code-body">
+        <div><span class="comment"># Provision the server</span></div>
+        <div><span class="cmd">scp -r nimbuspanel root@your-server:/root/</span></div>
+        <div><span class="cmd">ssh root@your-server</span></div>
+        <div><span class="cmd">cd nimbuspanel && bash provision/provision.sh</span></div>
+        <div>&nbsp;</div>
+        <div><span class="output">✓ nginx · PHP 8.2+8.3 · Node 22 · MariaDB</span></div>
+        <div><span class="output">✓ SSL · Postfix · Dovecot · fail2ban</span></div>
+        <div>&nbsp;</div>
+        <div><span class="comment"># Deploy the panel</span></div>
+        <div><span class="cmd">bash scripts/deploy.sh</span></div>
+        <div>&nbsp;</div>
+        <div><span class="output">✓ Panel running at http://your-server-ip</span></div>
+        <div><span class="output">✓ Set your domain + SSL from the Settings page</span></div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- Comparison -->
+<section class="compare">
+  <div class="container">
+    <h2>Why NimbusPanel?</h2>
+    <p class="sub">Built different, on purpose</p>
+    <table>
+      <thead>
+        <tr><th>Feature</th><th>NimbusPanel</th><th>cPanel</th><th>CyberPanel</th><th>CloudPanel</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>Min RAM</td><td class="yes">848 MB</td><td>2 GB</td><td>1 GB</td><td>1 GB</td></tr>
+        <tr><td>Node.js deploy pipeline</td><td class="yes">Built-in</td><td class="no">—</td><td class="no">—</td><td class="no">—</td></tr>
+        <tr><td>File manager</td><td class="yes">Built-in</td><td class="yes">Yes</td><td class="yes">Yes</td><td class="no">—</td></tr>
+        <tr><td>Email + Webmail</td><td class="yes">Built-in</td><td class="yes">Yes</td><td class="yes">Yes</td><td class="no">—</td></tr>
+        <tr><td>DKIM signing</td><td class="yes">Built-in</td><td class="yes">Yes</td><td class="no">—</td><td class="no">—</td></tr>
+        <tr><td>.htaccess mode</td><td class="yes">Per-site</td><td class="yes">Apache</td><td class="yes">LiteSpeed</td><td class="no">—</td></tr>
+        <tr><td>License</td><td class="yes">Open source</td><td>$%</td><td>Free + Pro</td><td>Free</td></tr>
+        <tr><td>Docker required</td><td class="yes">No</td><td class="yes">No</td><td class="yes">No</td><td class="no">Optional</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<!-- CTA -->
+<section class="cta">
+  <div class="container">
+    <h2>Ready to take control?</h2>
+    <p>Deploy your first site in under 5 minutes.</p>
+    <a href="#install" class="btn-primary" style="background:var(--white);color:var(--emerald);">Start Now — It's Free</a>
+  </div>
+</section>
+
+<!-- Footer -->
+<footer class="footer">
+  <div class="container">
+    <div class="links">
+      <a href="#features">Features</a>
+      <a href="#install">Install</a>
+      <a href="https://github.com/youruser/nimbuspanel">GitHub</a>
+      <a href="https://github.com/youruser/nimbuspanel/wiki">Docs</a>
+    </div>
+    <p>© 2026 NimbusPanel. Open source under MIT License.</p>
+  </div>
+</footer>
+
+</body>
+</html>

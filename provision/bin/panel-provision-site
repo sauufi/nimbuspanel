@@ -1,0 +1,254 @@
+#!/usr/bin/env bash
+# ============================================================
+# panel-provision-site — create/update a site (linux user,
+# directories, nginx vhost, PHP-FPM pool, optional Apache vhost).
+# Invoked via sudo by user 'panel'; all arguments are validated.
+#
+#   panel-provision-site <domain> <php|node> <phpVersion|port> [--ssl] [--apache]
+#
+#   php  : <phpVersion> must match a /etc/php/<version> directory
+#   node : <port> 30000-39999 (allocated by the panel backend)
+#   --ssl  : write the 443 block — the certificate must already
+#            exist (issued by panel-issue-ssl) in /etc/nginx/ssl/<domain>/
+#   --apache (php only): serve the site through Apache 127.0.0.1:8081
+#            behind nginx so .htaccess works as-is. PHP still runs
+#            on the site's own FPM pool (mod proxy_fcgi).
+#
+# Idempotent: safe to re-run; vhosts are rewritten entirely.
+# Config test failure (nginx -t / apache2ctl configtest) rolls back.
+# ============================================================
+set -euo pipefail
+
+DOMAIN_RE='^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$'
+APACHE_BACKEND="127.0.0.1:8081"
+NGINX_AVAIL="/etc/nginx/sites-available"
+NGINX_ENABLED="/etc/nginx/sites-enabled"
+APACHE_AVAIL="/etc/apache2/sites-available"
+APACHE_ENABLED="/etc/apache2/sites-enabled"
+
+DOMAIN="${1:-}"; TYPE="${2:-}"; VALUE="${3:-}"
+SSL=""; APACHE=""
+
+usage() { echo "usage: panel-provision-site <domain> <php|node> <version|port> [--ssl] [--apache]" >&2; exit 64; }
+fail()  { echo "panel-provision-site: $*" >&2; exit 1; }
+
+[ $# -ge 3 ] && [ $# -le 5 ] || usage
+DOMAIN="${DOMAIN,,}"
+[[ "$DOMAIN" =~ $DOMAIN_RE ]] || fail "invalid domain: $DOMAIN"
+shift 3
+for flag in "$@"; do
+    case "$flag" in
+        --ssl)    SSL="--ssl" ;;
+        --apache) APACHE="--apache" ;;
+        *) usage ;;
+    esac
+done
+
+SITE_ROOT="/var/www/$DOMAIN"
+VHOST="$NGINX_AVAIL/$DOMAIN.conf"
+POOL_VER=""
+
+case "$TYPE" in
+    php)
+        [[ "$VALUE" =~ ^[0-9]+\.[0-9]+$ ]] || fail "invalid PHP version: $VALUE"
+        [ -d "/etc/php/$VALUE" ] || fail "PHP $VALUE is not installed on this server"
+        POOL_VER="$VALUE"
+        ;;
+    node)
+        [[ "$VALUE" =~ ^[0-9]{5}$ ]] || fail "invalid port: $VALUE"
+        [ "$VALUE" -ge 30000 ] && [ "$VALUE" -le 39999 ] || fail "port outside the 30000-39999 range: $VALUE"
+        [ -z "$APACHE" ] || fail "--apache is only valid for PHP sites"
+        ;;
+    *) fail "type must be 'php' or 'node'" ;;
+esac
+
+if [ -n "$APACHE" ]; then
+    command -v apache2ctl >/dev/null 2>&1 || \
+        fail "apache mode is not installed — run provisioning (apache step)"
+fi
+
+if [ "$SSL" = "--ssl" ]; then
+    [ -f "/etc/nginx/ssl/$DOMAIN/fullchain.pem" ] || \
+        fail "certificate missing at /etc/nginx/ssl/$DOMAIN — run panel-issue-ssl first"
+fi
+
+# Per-site user: 8-char hash keeps it short and unique; the real
+# domain is stored in the GECOS comment field.
+# NOTE: the comment must NOT contain ':' — shadow-utils >= 4.11
+# rejects it because ':' separates fields in /etc/passwd.
+SITE_USER="site-$(printf '%s' "$DOMAIN" | md5sum | cut -c1-8)"
+id -u "$SITE_USER" &>/dev/null || \
+    useradd -r -d "$SITE_ROOT" -s /usr/sbin/nologin -c "site $DOMAIN" "$SITE_USER"
+
+mkdir -p "$SITE_ROOT"/{htdocs,logs,shared}
+chown -R "$SITE_USER:$SITE_USER" "$SITE_ROOT"
+chmod 0755 "$SITE_ROOT"
+
+# Welcome page when the docroot is still empty (avoid confusing 403s)
+if [ ! -e "$SITE_ROOT/htdocs/index.html" ] && [ ! -e "$SITE_ROOT/htdocs/index.php" ]; then
+    printf '<!doctype html><meta charset="utf-8"><title>%s</title><h1>%s</h1><p>Site is live — replace this file via upload/git.</p>\n' \
+        "$DOMAIN" "$DOMAIN" > "$SITE_ROOT/htdocs/index.html"
+    chown "$SITE_USER:$SITE_USER" "$SITE_ROOT/htdocs/index.html"
+fi
+
+# ---------- PHP-FPM pool (php type only) ----------
+if [ -n "$POOL_VER" ]; then
+    cat > "/etc/php/$POOL_VER/fpm/pool.d/$DOMAIN.conf" <<EOF
+; managed by panel — do not edit by hand
+[$DOMAIN]
+user = $SITE_USER
+group = $SITE_USER
+listen = /run/php/php$POOL_VER-fpm-$DOMAIN.sock
+listen.acl_users = www-data
+pm = dynamic
+pm.max_children = 5
+pm.start_servers = 2
+pm.min_spare_servers = 1
+pm.max_spare_servers = 3
+slowlog = $SITE_ROOT/logs/php-slow.log
+php_admin_value[error_log] = $SITE_ROOT/logs/php-error.log
+php_admin_flag[log_errors] = on
+EOF
+fi
+
+# ---------- nginx vhost ----------
+# proxy_block: used by apache mode (→ Apache 8081, .htaccess active)
+# and node mode (→ application port)
+proxy_block() { # $1 = target host:port
+    cat <<EOF
+    location / {
+        proxy_pass http://$1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_read_timeout 60s;
+    }
+EOF
+}
+
+php_block() {
+    cat <<EOF
+    root $SITE_ROOT/htdocs;
+    index index.php index.html;
+    access_log $SITE_ROOT/logs/access.log;
+    error_log  $SITE_ROOT/logs/error.log;
+    include /etc/nginx/panel-rules/$DOMAIN.conf;
+    location ^~ /.well-known/acme-challenge/ { root $SITE_ROOT/htdocs; allow all; }
+    location / { try_files \$uri \$uri/ /index.php?\$args; }
+    location ~ \.php\$ {
+        include snippets/fastcgi-php.conf;
+        fastcgi_pass unix:/run/php/php$POOL_VER-fpm-$DOMAIN.sock;
+    }
+    location ~ /\. { deny all; }
+EOF
+}
+
+app_block() {
+    if [ "$TYPE" = "php" ] && [ -z "$APACHE" ]; then
+        php_block
+    elif [ "$TYPE" = "php" ]; then
+        # apache mode: nginx only proxies + serves the acme webroot
+        echo "    location ^~ /.well-known/acme-challenge/ { root $SITE_ROOT/htdocs; allow all; }"
+        proxy_block "$APACHE_BACKEND"
+    else
+        echo "    location ^~ /.well-known/acme-challenge/ { root $SITE_ROOT/htdocs; allow all; }"
+        proxy_block "127.0.0.1:$VALUE"
+    fi
+}
+
+{
+    echo "# BEGIN PANEL domain=$DOMAIN type=$TYPE apache=$([ -n "$APACHE" ] && echo yes || echo no)"
+    if [ "$SSL" = "--ssl" ]; then
+        echo "server {"
+        echo "    listen 80;"
+        echo "    server_name $DOMAIN;"
+        echo "    location ^~ /.well-known/acme-challenge/ { root $SITE_ROOT/htdocs; allow all; }"
+        echo "    location / { return 301 https://\$host\$request_uri; }"
+        echo "}"
+        echo "server {"
+        echo "    listen 443 ssl http2;"
+        echo "    server_name $DOMAIN;"
+        echo "    ssl_certificate     /etc/nginx/ssl/$DOMAIN/fullchain.pem;"
+        echo "    ssl_certificate_key /etc/nginx/ssl/$DOMAIN/privkey.pem;"
+        echo "    ssl_protocols TLSv1.2 TLSv1.3;"
+        app_block
+        echo "}"
+    else
+        echo "server {"
+        echo "    listen 80;"
+        echo "    server_name $DOMAIN;"
+        app_block
+        echo "}"
+    fi
+    echo "# END PANEL"
+} > "$VHOST"
+ln -sfn "$VHOST" "$NGINX_ENABLED/$DOMAIN.conf"
+
+# ---------- Apache vhost (.htaccess mode, php+apache only) ----------
+if [ -n "$APACHE" ]; then
+    AVHOST="$APACHE_AVAIL/$DOMAIN.conf"
+    cat > "$AVHOST" <<EOF
+# managed by panel — do not edit by hand
+<VirtualHost $APACHE_BACKEND>
+    ServerName $DOMAIN
+    DocumentRoot $SITE_ROOT/htdocs
+
+    <Directory $SITE_ROOT/htdocs>
+        Options -Indexes +FollowSymLinks
+        AllowOverride All
+        Require all granted
+    </Directory>
+
+    <FilesMatch \.php$>
+        SetHandler "proxy:unix:/run/php/php$POOL_VER-fpm-$DOMAIN.sock|fcgi://localhost"
+    </FilesMatch>
+
+    ErrorLog /var/log/apache2/$DOMAIN-error.log
+    CustomLog /var/log/apache2/$DOMAIN-access.log combined
+</VirtualHost>
+EOF
+    ln -sfn "$AVHOST" "$APACHE_ENABLED/$DOMAIN.conf"
+else
+    # site switched from apache mode to nginx → clean up the apache vhost
+    if [ -d "$APACHE_ENABLED" ]; then
+        rm -f "$APACHE_ENABLED/$DOMAIN.conf" "$APACHE_AVAIL/$DOMAIN.conf"
+    fi
+fi
+
+# ---------- Validate & activate ----------
+# Custom rules include (nginx mode only) — file must exist before nginx -t
+if [ "$TYPE" = "php" ] && [ -z "$APACHE" ]; then
+    mkdir -p /etc/nginx/panel-rules
+    [ -f "/etc/nginx/panel-rules/$DOMAIN.conf" ] || \
+        printf '# managed by panel — custom nginx rules for %s (empty)\n' "$DOMAIN" > "/etc/nginx/panel-rules/$DOMAIN.conf"
+fi
+
+NGINX_ERR="$(mktemp)"
+if ! nginx -t >"$NGINX_ERR" 2>&1; then
+    rm -f "$VHOST" "$NGINX_ENABLED/$DOMAIN.conf" "$APACHE_ENABLED/$DOMAIN.conf" "$APACHE_AVAIL/$DOMAIN.conf"
+    cat "$NGINX_ERR" >&2
+    rm -f "$NGINX_ERR"
+    fail "nginx -t failed — vhost rolled back, no changes applied"
+fi
+rm -f "$NGINX_ERR"
+
+if [ -n "$APACHE" ]; then
+    APACHE_ERR="$(mktemp)"
+    if ! apache2ctl configtest >"$APACHE_ERR" 2>&1; then
+        rm -f "$VHOST" "$NGINX_ENABLED/$DOMAIN.conf" "$APACHE_ENABLED/$DOMAIN.conf" "$APACHE_AVAIL/$DOMAIN.conf"
+        cat "$APACHE_ERR" >&2
+        rm -f "$APACHE_ERR"
+        fail "apache2ctl configtest failed — vhost rolled back, no changes applied"
+    fi
+    rm -f "$APACHE_ERR"
+fi
+
+systemctl reload nginx
+[ -n "$POOL_VER" ] && systemctl reload "php$POOL_VER-fpm"
+[ -n "$APACHE" ] && systemctl reload apache2
+
+echo "OK: site $DOMAIN ($TYPE${APACHE:+ +apache}) active (docroot: $SITE_ROOT/htdocs)"

@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+# ============================================================
+# panel-write-nginx-rules — write a site's custom nginx rules file.
+#   echo 'rewrite ...;' | sudo panel-write-nginx-rules <domain>
+# Content is written to /etc/nginx/panel-rules/<domain>.conf which is
+# include()-d from the panel-managed vhost (server-block context).
+# The new file is validated with nginx -t before the reload; on
+# failure the previous file is restored and nothing is reloaded.
+# ============================================================
+set -euo pipefail
+
+DOMAIN_RE='^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$'
+RULES_DIR="/etc/nginx/panel-rules"
+
+DOMAIN="${1:-}"
+
+[ $# -eq 1 ] || { echo "usage: panel-write-nginx-rules <domain>" >&2; exit 64; }
+DOMAIN="${DOMAIN,,}"
+[[ "$DOMAIN" =~ $DOMAIN_RE ]] || { echo "panel-write-nginx-rules: invalid domain" >&2; exit 64; }
+
+F="$RULES_DIR/$DOMAIN.conf"
+mkdir -p "$RULES_DIR"
+[ -f "$F" ] || printf '# managed by panel — custom nginx rules for %s (empty)\n' "$DOMAIN" > "$F"
+
+NEW="$(mktemp)"
+OLD="$(mktemp)"
+trap 'rm -f "$NEW" "$OLD"' EXIT
+cat > "$NEW"
+chmod 0644 "$NEW"
+cp -a "$F" "$OLD"
+
+mv "$NEW" "$F"
+trap - EXIT
+
+if ! nginx -t >/dev/null 2>&1; then
+    cp -a "$OLD" "$F"
+    nginx -t 2>&1 | head -5 >&2
+    echo "panel-write-nginx-rules: invalid nginx config — previous rules restored" >&2
+    exit 1
+fi
+
+systemctl reload nginx
+echo "OK: nginx rules for $DOMAIN saved & applied"

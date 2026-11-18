@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+# ============================================================
+# panel-node-rollback — roll a node site back to the previous release.
+#   panel-node-rollback <domain> <siteId>
+# ============================================================
+set -euo pipefail
+
+DOMAIN_RE='^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$'
+DOMAIN="${1:-}"; SITE_ID="${2:-}"
+
+usage() { echo "usage: panel-node-rollback <domain> <siteId>" >&2; exit 64; }
+fail()  { echo "panel-node-rollback: $*" >&2; exit 1; }
+
+[ $# -eq 2 ] || usage
+DOMAIN="${DOMAIN,,}"
+[[ "$DOMAIN" =~ $DOMAIN_RE ]] || fail "invalid domain"
+[[ "$SITE_ID" =~ ^[0-9]+$ ]] || fail "siteId must be numeric"
+
+SITE_ROOT="/var/www/$DOMAIN"
+CURRENT="$(readlink "$SITE_ROOT/current" 2>/dev/null || true)"
+[ -n "$CURRENT" ] || fail "no active release yet"
+CUR_NAME="$(basename "$CURRENT")"
+
+# releases sorted newest → oldest; pick the one right after current
+TARGET="$(cd "$SITE_ROOT/releases" 2>/dev/null && ls -1 | sort -r | awk -v cur="$CUR_NAME" 'found {print; exit} $0 == cur {found=1}')"
+[ -n "$TARGET" ] || fail "no release older than $CUR_NAME to roll back to"
+
+echo "Rollback: $CUR_NAME → $TARGET"
+ln -sfn "$SITE_ROOT/releases/$TARGET" "$SITE_ROOT/current"
+systemctl restart "app-$SITE_ID"
+
+for _ in $(seq 1 30); do
+    sleep 1
+    systemctl is-active "app-$SITE_ID" >/dev/null 2>&1 || continue
+    break
+done
+systemctl is-active "app-$SITE_ID" >/dev/null 2>&1 || fail "service app-$SITE_ID is not active after rollback"
+
+echo "OK: now running release $TARGET"

@@ -1,0 +1,41 @@
+# Dependencies
+node_modules/
+
+# Build outputs
+dist/
+backend/dist/
+frontend/dist/
+
+# Runtime data
+data/
+*.db
+*.db-wal
+*.db-shm
+
+# Environment
+.env
+.env.*
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Logs
+*.log
+npm-debug.log*
+
+# Cache
+.npmcache/
+__pycache__/
+
+# Test artifacts
+ui-preview/
+gui-test-screenshots/
