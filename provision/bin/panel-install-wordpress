@@ -1,0 +1,155 @@
+#!/usr/bin/env bash
+# ============================================================
+# panel-install-wordpress — one-click WordPress installer.
+# Invoked via sudo by user 'panel'.
+#
+#   sudo panel-install-wordpress <domain> [dbname]
+#
+# Steps:
+#   1. Download latest WordPress from wordpress.org
+#   2. Extract to the site's docroot (htdocs must be empty-ish)
+#   3. Create MariaDB database + user with strong password
+#   4. Generate wp-config.php with secure salts
+#   5. Set correct file permissions for the site user
+#   6. Print the database credentials for the panel to show
+# ============================================================
+set -euo pipefail
+
+DOMAIN_RE='^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$'
+NAME_RE='^[a-z][a-z0-9_]{0,38}$'
+
+WP_URL="https://wordpress.org/latest.tar.gz"
+MARIADB=/usr/bin/mariadb
+
+DOMAIN="${1:-}"
+DBNAME="${2:-}"
+
+usage() { echo "usage: panel-install-wordpress <domain> [dbname]" >&2; exit 64; }
+fail()  { echo "panel-install-wordpress: $*" >&2; exit 1; }
+
+[ $# -ge 1 ] && [ $# -le 2 ] || usage
+DOMAIN="${DOMAIN,,}"
+[[ "$DOMAIN" =~ $DOMAIN_RE ]] || fail "invalid domain: $DOMAIN"
+
+SITE_ROOT="/var/www/$DOMAIN"
+HTDOCS="$SITE_ROOT/htdocs"
+SITE_USER="site-$(printf '%s' "$DOMAIN" | md5sum | cut -c1-8)"
+id -u "$SITE_USER" &>/dev/null || fail "site does not exist (provision it first)"
+[ -d "$HTDOCS" ] || fail "docroot missing: $HTDOCS"
+
+# Auto-generate a safe DB name from the domain if not provided
+if [ -z "$DBNAME" ]; then
+    DBNAME="wp_$(printf '%s' "$DOMAIN" | tr -cd 'a-z0-9' | cut -c1-16)"
+fi
+DBNAME="${DBNAME,,}"
+[[ "$DBNAME" =~ $NAME_RE ]] || fail "invalid database name: $DBNAME (a-z, 0-9, _ only)"
+
+# Guard: don't overwrite an existing WordPress
+[ -f "$HTDOCS/wp-config.php" ] && fail "WordPress already installed (wp-config.php exists)"
+
+# Guard: docroot should be mostly empty (allow only the welcome page and index)
+EXTRA=$(find "$HTDOCS" -maxdepth 1 -mindepth 1 ! -name 'index.html' ! -name '.well-known' | wc -l)
+[ "$EXTRA" -eq 0 ] || fail "docroot is not empty ($EXTRA items). Clear it first."
+
+# ---- 1. Download & extract WordPress ----
+echo "[1/4] Downloading WordPress..."
+TMP="$(mktemp -d)"
+trap 'rm -rf "$TMP"' EXIT
+# site user harus bisa traverse ke dalam dir ini untuk cp
+chmod 0755 "$TMP"
+curl -fsSL --retry 3 "$WP_URL" -o "$TMP/wp.tar.gz" || fail "download failed"
+tar xzf "$TMP/wp.tar.gz" -C "$TMP" || fail "extract failed"
+
+# Move WP files into htdocs (as site user for correct ownership)
+rm -f "$HTDOCS/index.html" 2>/dev/null || true
+chown -R "$SITE_USER:$SITE_USER" "$TMP/wordpress"
+runuser -u "$SITE_USER" -- cp -a "$TMP/wordpress/." "$HTDOCS/"
+echo "  WordPress $(grep -o "Version:.*" "$HTDOCS/readme.html" | head -1 | awk '{print $2}' || echo 'latest') extracted"
+
+# ---- 2. Create database ----
+echo "[2/4] Creating database..."
+DBUSER="u_${DBNAME}"
+DBPASS="$(openssl rand -base64 18 | tr -dc 'A-Za-z0-9' | head -c 20)"
+# escape single quotes in pass (unlikely but safe)
+ESC_PASS="${DBPASS//\'/\'\'}"
+ESC_USER="${DBUSER//\'/\'\'}"
+
+$MARIADB <<SQL || fail "database creation failed"
+CREATE DATABASE IF NOT EXISTS \`$DBNAME\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+CREATE USER IF NOT EXISTS '$ESC_USER'@'localhost';
+ALTER USER '$ESC_USER'@'localhost' IDENTIFIED BY '$ESC_PASS';
+GRANT ALL PRIVILEGES ON \`$DBNAME\`.* TO '$ESC_USER'@'localhost';
+FLUSH PRIVILEGES;
+SQL
+echo "  Database: $DBNAME (user: $DBUSER)"
+
+# ---- 3. Generate wp-config.php ----
+echo "[3/4] Generating wp-config.php..."
+SALTS="$(curl -fsSL --max-time 10 https://api.wordpress.org/secret-key/1.1/salt/ 2>/dev/null || true)"
+[ -n "$SALTS" ] || SALTS="$(# fallback: generate random salts
+    for k in AUTH_KEY SECURE_AUTH_KEY LOGGED_IN_KEY NONCE_KEY AUTH_SALT SECURE_AUTH_SALT LOGGED_IN_SALT NONCE_SALT; do
+        echo "define( '$k', '$(openssl rand -hex 32)' );"
+    done
+)"
+
+cat > "$HTDOCS/wp-config.php" <<WPCC
+<?php
+/** NimbusPanel — managed WordPress configuration */
+define( 'DB_NAME', '$DBNAME' );
+define( 'DB_USER', '$DBUSER' );
+define( 'DB_PASSWORD', '$DBPASS' );
+define( 'DB_HOST', 'localhost' );
+define( 'DB_CHARSET', 'utf8mb4' );
+define( 'DB_COLLATE', '' );
+
+define( 'AUTH_KEY',         '$(openssl rand -hex 32)' );
+define( 'SECURE_AUTH_KEY',  '$(openssl rand -hex 32)' );
+define( 'LOGGED_IN_KEY',    '$(openssl rand -hex 32)' );
+define( 'NONCE_KEY',        '$(openssl rand -hex 32)' );
+define( 'AUTH_SALT',        '$(openssl rand -hex 32)' );
+define( 'SECURE_AUTH_SALT', '$(openssl rand -hex 32)' );
+define( 'LOGGED_IN_SALT',   '$(openssl rand -hex 32)' );
+define( 'NONCE_SALT',       '$(openssl rand -hex 32)' );
+
+\$table_prefix = 'wp_';
+define( 'WP_DEBUG', false );
+
+/* NimibusPanel: increase PHP limits for WP */
+define( 'WP_MEMORY_LIMIT', '256M' );
+define( 'WP_MAX_MEMORY_LIMIT', '256M' );
+
+if ( ! defined( 'ABSPATH' ) ) {
+    define( 'ABSPATH', __DIR__ . '/' );
+}
+
+require_once ABSPATH . 'wp-settings.php';
+WPCC
+
+# ---- 4. Set permissions ----
+echo "[4/4] Setting permissions..."
+chown "$SITE_USER:$SITE_USER" "$HTDOCS/wp-config.php"
+chmod 0640 "$HTDOCS/wp-config.php"
+
+# wp-content needs to be writable by the site user (already is)
+# .htaccess for pretty permalinks (nginx try_files handles this, but Apache mode needs it)
+cat > "$HTDOCS/.htaccess" <<'HTA'
+# BEGIN WordPress
+<IfModule mod_rewrite.c>
+RewriteEngine On
+RewriteBase /
+RewriteRule ^index\.php$ - [L]
+RewriteCond %{REQUEST_FILENAME} !-f
+RewriteCond %{REQUEST_FILENAME} !-d
+RewriteRule . /index.php [L]
+</IfModule>
+# END WordPress
+HTA
+chown "$SITE_USER:$SITE_USER" "$HTDOCS/.htaccess"
+
+# Output credentials for the panel to capture
+echo "OK: WordPress installed on $DOMAIN"
+echo "WP_URL: https://$DOMAIN/wp-admin/install.php"
+echo "WP_DB_NAME: $DBNAME"
+echo "WP_DB_USER: $DBUSER"
+echo "WP_DB_PASS: $DBPASS"
+echo "WP_DB_HOST: localhost"

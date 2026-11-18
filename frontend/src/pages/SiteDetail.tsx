@@ -104,6 +104,20 @@ export default function SiteDetail() {
     catch (err) { setError(err instanceof Error ? err.message : 'Failed'); setBusy(null) }
   }
 
+  const [wpCreds, setWpCreds] = useState<{ installUrl?: string; credentials?: { dbName: string; dbUser: string; dbPass: string; dbHost: string } } | null>(null)
+
+  async function installWordPress() {
+    if (!confirm('Install WordPress on this site? The docroot must be empty — existing index.html will be replaced.')) return
+    setBusy('deploy'); setError(''); setNotice('')
+    try {
+      const res = await api<{ ok: boolean; installUrl?: string; credentials?: { dbName: string; dbUser: string; dbPass: string; dbHost: string } }>(`/sites/${id}/wordpress`, { method: 'POST', body: '{}' })
+      setWpCreds(res)
+      setNotice('WordPress installed — credentials below')
+      await load()
+    } catch (err) { setError(err instanceof Error ? err.message : 'WordPress install failed') }
+    finally { setBusy(null) }
+  }
+
   if (error && !detail) return <p className="rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">{error}</p>
   if (!detail) return <p className="text-slate-500">Loading…</p>
 
@@ -188,22 +202,51 @@ export default function SiteDetail() {
                 </button>
               )}
               {site.type === 'php' && (
-                <button
-                  onClick={async () => {
-                    setBusy('deploy'); setError(''); setNotice('')
-                    try { const res = await api<{ output: string }>(`/sites/${id}/adminer`, { method: 'POST' }); setNotice(res.output) }
-                    catch (err) { setError(err instanceof Error ? err.message : 'Adminer install failed') }
-                    finally { setBusy(null) }
-                  }}
-                  disabled={busy !== null}
-                  className="rounded-lg border border-slate-300 bg-white px-4 py-2.5 text-sm font-medium text-slate-700 transition hover:bg-slate-50 disabled:opacity-50"
-                >
-                  {busy === 'deploy' ? 'Installing…' : 'Install Adminer'}
-                </button>
+                <>
+                  <button
+                    onClick={installWordPress}
+                    disabled={busy !== null}
+                    className="flex items-center gap-2 rounded-lg bg-blue-600 px-4 py-2.5 text-sm font-semibold text-white transition hover:bg-blue-500 disabled:opacity-50"
+                  >
+                    {busy === 'deploy' ? 'Installing WordPress…' : 'Install WordPress'}
+                  </button>
+                  <button
+                    onClick={async () => {
+                      setBusy('deploy'); setError(''); setNotice('')
+                      try { const res = await api<{ output: string }>(`/sites/${id}/adminer`, { method: 'POST' }); setNotice(res.output) }
+                      catch (err) { setError(err instanceof Error ? err.message : 'Adminer install failed') }
+                      finally { setBusy(null) }
+                    }}
+                    disabled={busy !== null}
+                    className="rounded-lg border border-slate-300 bg-white px-4 py-2.5 text-sm font-medium text-slate-700 transition hover:bg-slate-50 disabled:opacity-50"
+                  >
+                    {busy === 'deploy' ? 'Installing…' : 'Install Adminer'}
+                  </button>
+                </>
               )}
             </div>
             {!site.ssl_enabled && <p className="text-xs text-slate-400">Make sure the domain's DNS already points to this server before issuing SSL.</p>}
           </section>
+
+          {wpCreds?.credentials && (
+            <section className="space-y-3 rounded-xl border border-blue-200 bg-blue-50 p-6">
+              <div className="flex items-center justify-between">
+                <h2 className="text-sm font-semibold text-blue-900">WordPress Installed 🎉</h2>
+                {wpCreds.installUrl && (
+                  <a href={wpCreds.installUrl} target="_blank" rel="noreferrer"
+                    className="rounded-lg bg-blue-600 px-4 py-2 text-xs font-semibold text-white hover:bg-blue-500">
+                    Complete setup →
+                  </a>
+                )}
+              </div>
+              <p className="text-xs text-blue-700">Database credentials (also saved in the Databases page):</p>
+              <pre className="overflow-auto rounded-lg border border-blue-200 bg-white p-3 font-mono text-xs text-slate-700">{`Database: ${wpCreds.credentials.dbName}
+User:     ${wpCreds.credentials.dbUser}
+Password: ${wpCreds.credentials.dbPass}
+Host:     ${wpCreds.credentials.dbHost}`}</pre>
+              <p className="text-xs text-blue-600">Open the "Complete setup" link to pick your WordPress admin username &amp; password.</p>
+            </section>
+          )}
 
           <section className="space-y-3 rounded-xl border border-red-200 bg-white p-6 shadow-sm">
             <h2 className="text-sm font-semibold text-red-700">Delete site</h2>

@@ -401,6 +401,50 @@ export async function sitesRoutes(app: FastifyInstance): Promise<void> {
     return { ok: true, output: tail(res.stdout) }
   })
 
+  // ---- WordPress one-click install (php sites) ----
+
+  app.post('/api/sites/:id/wordpress', { preHandler: [requireAuth] }, async (req, reply) => {
+    const site = getSite(Number((req.params as { id: string }).id))
+    if (!site || site.type !== 'php') return reply.code(404).send({ error: 'PHP site not found' })
+
+    const parsed = z.object({ dbname: z.string().regex(/^[a-z][a-z0-9_]{0,38}$/).optional() }).safeParse(req.body ?? {})
+    if (!parsed.success) return reply.code(400).send({ error: 'Invalid database name' })
+
+    const args = ['panel-install-wordpress', site.domain]
+    if (parsed.data.dbname) args.push(parsed.data.dbname)
+
+    const res = await sudo(args, { timeoutMs: 120_000 })
+    if (res.code !== 0) {
+      audit('site.wordpress.failed', { domain: site.domain, error: helperError(res) })
+      return reply.code(500).send({ error: helperError(res) })
+    }
+
+    // Parse credentials from helper output (WP_DB_NAME: xxx, etc.)
+    const creds: Record<string, string> = {}
+    for (const line of res.stdout.trim().split('\n')) {
+      const m = line.match(/^WP_(\w+): (.+)$/)
+      if (m) creds[m[1]] = m[2]
+    }
+
+    // Register the database in panel.db so it shows in Database page
+    if (creds.DB_NAME && creds.DB_USER && creds.DB_PASS) {
+      db.prepare('INSERT OR IGNORE INTO databases (site_id, name, db_user, db_pass) VALUES (?, ?, ?, ?)')
+        .run(site.id, creds.DB_NAME, creds.DB_USER, creds.DB_PASS)
+    }
+
+    audit('site.wordpress', { domain: site.domain, db: creds.DB_NAME })
+    return {
+      ok: true,
+      installUrl: creds.URL,
+      credentials: {
+        dbName: creds.DB_NAME,
+        dbUser: creds.DB_USER,
+        dbPass: creds.DB_PASS,
+        dbHost: creds.DB_HOST || 'localhost',
+      },
+    }
+  })
+
   // ---- SSL & hapus ----
 
   app.post('/api/sites/:id/ssl', { preHandler: [requireAuth] }, async (req, reply) => {
