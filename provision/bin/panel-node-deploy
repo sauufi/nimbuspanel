@@ -98,6 +98,7 @@ Group=$SITE_USER
 WorkingDirectory=$SITE_ROOT/current
 Environment=NODE_ENV=production
 Environment=PORT=$PORT
+Environment=PATH=$NODEBIN:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 EnvironmentFile=-$SITE_ROOT/shared/.env
 ExecStart=$EXEC
 Restart=always
