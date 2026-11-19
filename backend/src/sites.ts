@@ -445,6 +445,63 @@ export async function sitesRoutes(app: FastifyInstance): Promise<void> {
     }
   })
 
+  // ---- Cron Job Manager ----
+
+  app.get('/api/sites/:id/cron', { preHandler: [requireAuth] }, async (req, reply) => {
+    const site = getSite(Number((req.params as { id: string }).id))
+    if (!site) return reply.code(404).send({ error: 'Site not found' })
+    const res = await sudo(['panel-cron', 'list', site.domain])
+    if (res.code !== 0) return reply.code(500).send({ error: helperError(res) })
+    const jobs = res.stdout.trim().split('\n').filter(Boolean).map((line) => {
+      const [id, schedule, command, enabled] = line.split('|')
+      return { id, schedule, command, enabled: enabled === 'yes' }
+    })
+    return { jobs }
+  })
+
+  app.post('/api/sites/:id/cron', { preHandler: [requireAuth] }, async (req, reply) => {
+    const site = getSite(Number((req.params as { id: string }).id))
+    if (!site) return reply.code(404).send({ error: 'Site not found' })
+    const Body = z.object({
+      schedule: z.string().min(1).max(100),
+      command: z.string().min(1).max(500),
+    }).safeParse(req.body)
+    if (!Body.success) return reply.code(400).send({ error: 'Schedule and command are required' })
+
+    const res = await sudo(['panel-cron', 'add', site.domain, Body.data.schedule, Body.data.command])
+    if (res.code !== 0) {
+      audit('cron.add.failed', { domain: site.domain, error: helperError(res) })
+      return reply.code(500).send({ error: helperError(res) })
+    }
+    const jobId = res.stdout.trim().split('\n').find((l) => l.startsWith('JOB-ID: '))?.slice(8) ?? ''
+    audit('cron.add', { domain: site.domain, schedule: Body.data.schedule })
+    return { ok: true, jobId }
+  })
+
+  app.delete('/api/sites/:id/cron', { preHandler: [requireAuth] }, async (req, reply) => {
+    const site = getSite(Number((req.params as { id: string }).id))
+    if (!site) return reply.code(404).send({ error: 'Site not found' })
+    const jobId = String((req.query as { jobId?: string }).jobId ?? '')
+    if (!/^[a-f0-9]{8}$/.test(jobId)) return reply.code(400).send({ error: 'Invalid job ID' })
+
+    const res = await sudo(['panel-cron', 'del', site.domain, jobId])
+    if (res.code !== 0) return reply.code(500).send({ error: helperError(res) })
+    audit('cron.del', { domain: site.domain, jobId })
+    return { ok: true }
+  })
+
+  app.post('/api/sites/:id/cron/toggle', { preHandler: [requireAuth] }, async (req, reply) => {
+    const site = getSite(Number((req.params as { id: string }).id))
+    if (!site) return reply.code(404).send({ error: 'Site not found' })
+    const Body = z.object({ jobId: z.string().regex(/^[a-f0-9]{8}$/) }).safeParse(req.body)
+    if (!Body.success) return reply.code(400).send({ error: 'Invalid job ID' })
+
+    const res = await sudo(['panel-cron', 'toggle', site.domain, Body.data.jobId])
+    if (res.code !== 0) return reply.code(500).send({ error: helperError(res) })
+    audit('cron.toggle', { domain: site.domain, jobId: Body.data.jobId })
+    return { ok: true }
+  })
+
   // ---- SSL & hapus ----
 
   app.post('/api/sites/:id/ssl', { preHandler: [requireAuth] }, async (req, reply) => {

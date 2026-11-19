@@ -1,0 +1,142 @@
+#!/usr/bin/env bash
+# ============================================================
+# panel-cron — manage cron jobs per site (via site user's crontab).
+# Invoked via sudo by user 'panel'.
+#
+#   panel-cron list <domain>          → JSON lines: id|schedule|command|enabled
+#   panel-cron add <domain> <schedule> <command>
+#   panel-cron del <domain> <job_id>
+#   panel-cron toggle <domain> <job_id>   → enable/disable
+#
+# Jobs are tagged with # panel-cron:<id> for identification.
+# Runs as the site's Linux user (correct file permissions).
+# ============================================================
+set -euo pipefail
+
+DOMAIN_RE='^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$'
+SCHED_RE='^[@a-zA-Z0-9*/, -]+$'
+
+ACTION="${1:-}"
+DOMAIN="${2:-}"
+
+fail() { echo "panel-cron: $*" >&2; exit 1; }
+
+usage() {
+  echo "usage: panel-cron <list|add|del|toggle> <domain> [args...]" >&2
+  exit 64
+}
+
+[ $# -ge 2 ] || usage
+DOMAIN="${DOMAIN,,}"
+[[ "$DOMAIN" =~ $DOMAIN_RE ]] || fail "invalid domain: $DOMAIN"
+
+SITE_USER="site-$(printf '%s' "$DOMAIN" | md5sum | cut -c1-8)"
+id -u "$SITE_USER" &>/dev/null || fail "site does not exist"
+
+AS_USER() { runuser -u "$SITE_USER" -- "$@"; }
+
+get_crontab() {
+  AS_USER crontab -l 2>/dev/null || true
+}
+
+set_crontab() {
+  AS_USER bash -c "printf '%s\n' \"\$1\" | crontab -" _ "$1"
+}
+
+case "$ACTION" in
+    list)
+        get_crontab | while IFS= read -r line; do
+            case "$line" in
+                "# panel-cron:"*)
+                    ID="$(echo "$line" | sed 's/# panel-cron:\([a-f0-9]*\).*/\1/')"
+                    ;;
+                "")
+                    continue
+                    ;;
+                \#*)
+                    continue
+                    ;;
+                *)
+                    # this is a job line — extract schedule (first 5 fields) and command
+                    SCHEDULE="$(echo "$line" | awk '{print $1, $2, $3, $4, $5}')"
+                    COMMAND="$(echo "$line" | awk '{for(i=6;i<=NF;i++) printf "%s ", $i; print ""}' | sed 's/ $//')"
+                    ENABLED="yes"
+                    if [ -n "${ID:-}" ]; then
+                        echo "${ID}|${SCHEDULE}|${COMMAND}|${ENABLED}"
+                        ID=""
+                    fi
+                    ;;
+            esac
+        done
+        ;;
+
+    add)
+        SCHEDULE="${3:-}"
+        COMMAND="${4:-}"
+        [ $# -eq 4 ] || fail "usage: panel-cron add <domain> <schedule> <command>"
+        [[ "$SCHEDULE" =~ $SCHED_RE ]] || fail "invalid schedule (only a-z 0-9 * / , - @ allowed)"
+        [ -n "$COMMAND" ] || fail "command is required"
+        [ "${#COMMAND}" -le 500 ] || fail "command too long (max 500 chars)"
+        # only block backtick (command substitution into this script itself);
+        # cron jobs run as the site user so redirects/vars are safe
+        case "$COMMAND" in
+            *'`'*) fail "command contains forbidden character: backtick" ;;
+        esac
+
+        ID="$(printf '%s' "$DOMAIN:$SCHEDULE:$COMMAND" | md5sum | cut -c1-8)"
+        CURRENT="$(get_crontab)"
+        NEW_CRON="${CURRENT}
+# panel-cron:${ID}
+${SCHEDULE} ${COMMAND}"
+        set_crontab "$NEW_CRON"
+        echo "OK: cron job added (id: ${ID})"
+        echo "JOB-ID: ${ID}"
+        ;;
+
+    del)
+        JOB_ID="${3:-}"
+        [ $# -eq 3 ] || fail "usage: panel-cron del <domain> <job_id>"
+        [[ "$JOB_ID" =~ ^[a-f0-9]{8}$ ]] || fail "invalid job id"
+
+        CURRENT="$(get_crontab)"
+        # remove the tag line and the job line that follows it
+        NEW_CRON="$(echo "$CURRENT" | awk -v id="# panel-cron:${JOB_ID}" '
+            $0 == id { skip = 1; next }
+            skip { skip = 0; next }
+            { print }
+        ')"
+        if [ "$NEW_CRON" = "$CURRENT" ]; then
+            fail "job not found: $JOB_ID"
+        fi
+        set_crontab "$NEW_CRON"
+        echo "OK: cron job removed (${JOB_ID})"
+        ;;
+
+    toggle)
+        JOB_ID="${3:-}"
+        [ $# -eq 3 ] || fail "usage: panel-cron toggle <domain> <job_id>"
+        [[ "$JOB_ID" =~ ^[a-f0-9]{8}$ ]] || fail "invalid job id"
+
+        CURRENT="$(get_crontab)"
+        TOGGLED="$(echo "$CURRENT" | awk -v id="# panel-cron:${JOB_ID}" '
+            $0 == id { found = 1; print; next }
+            found && /^#/ { found = 0; print; next }
+            found && /^@|^[\*0-9]/ {
+                if (substr($0, 1, 1) == "#") { print substr($0, 2) }
+                else { print "#" $0 }
+                found = 0
+                next
+            }
+            { print }
+        ')"
+        if [ "$TOGGLED" = "$CURRENT" ]; then
+            fail "job not found: $JOB_ID"
+        fi
+        set_crontab "$TOGGLED"
+        echo "OK: cron job toggled (${JOB_ID})"
+        ;;
+
+    *)
+        fail "unknown action: $ACTION (use list|add|del|toggle)"
+        ;;
+esac

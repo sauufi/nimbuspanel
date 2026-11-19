@@ -45,6 +45,7 @@ trap 'rm -f "$TMP"' EXIT
     echo "$PANEL_USER ALL=(root) NOPASSWD: $PANEL_BIN/panel-hostname *"
     echo "$PANEL_USER ALL=(root) NOPASSWD: $PANEL_BIN/panel-install-wordpress *"
     echo "$PANEL_USER ALL=(root) NOPASSWD: $PANEL_BIN/panel-site-ssh-setup *"
+    echo "$PANEL_USER ALL=(root) NOPASSWD: $PANEL_BIN/panel-cron *"
 } > "$TMP"
 
 # Backup cron is managed by the panel-backup helper itself (it reads the

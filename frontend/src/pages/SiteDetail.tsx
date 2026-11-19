@@ -1,12 +1,13 @@
 import { useEffect, useRef, useState } from 'react'
 import { useNavigate, useParams } from 'react-router-dom'
 import {
-  ChevronLeft, ExternalLink, FileText, FolderOpen, GitBranch,
+  ChevronLeft, Clock, ExternalLink, FileText, FolderOpen, GitBranch,
   Lock, Settings2, SquareTerminal, Terminal as TerminalIcon,
 } from 'lucide-react'
 import { api } from '../api'
 import FilesBrowser from '../components/FilesBrowser'
 import TerminalBox from '../components/Terminal'
+import CronManager from '../components/CronManager'
 
 interface Site {
   id: number
@@ -33,7 +34,7 @@ interface Detail {
   node?: { unit: string; currentRelease: string | null }
 }
 
-type Tab = 'overview' | 'files' | 'deploy' | 'env' | 'logs' | 'rules' | 'terminal'
+type Tab = 'overview' | 'files' | 'deploy' | 'env' | 'logs' | 'rules' | 'terminal' | 'cron'
 
 export default function SiteDetail() {
   const { id } = useParams()
@@ -135,6 +136,7 @@ export default function SiteDetail() {
     { key: 'logs', label: 'Logs', icon: <TerminalIcon className="h-3.5 w-3.5" />, show: isNode },
     { key: 'rules', label: 'URL Rules', icon: <FileText className="h-3.5 w-3.5" />, show: isNginxPhp },
     { key: 'terminal', label: 'Terminal', icon: <TerminalIcon className="h-3.5 w-3.5" />, show: true },
+    { key: 'cron', label: 'Cron', icon: <Clock className="h-3.5 w-3.5" />, show: true },
   ]
   const visibleTabs = tabs.filter((t) => t.show)
 
@@ -345,6 +347,9 @@ Host:     ${wpCreds.credentials.dbHost}`}</pre>
           title={`Terminal — ${site.domain} (site user)`}
         />
       )}
+
+      {/* ===== CRON ===== */}
+      {tab === 'cron' && <CronManager siteKey={site.id} domain={site.domain} />}
     </div>
   )
 }
