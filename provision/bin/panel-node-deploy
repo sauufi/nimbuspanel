@@ -76,6 +76,29 @@ ${BUILD:+$BUILD
 npm prune --omit=dev" || fail "build failed"
 RUN ln -sfn ../shared/.env "$REL/.env"
 
+# Next.js standalone optimization: if .next/standalone exists, remove
+# the full node_modules (standalone has its own minimal set) and copy
+# static assets into the standalone directory.
+# All ops run as ROOT (we're deleting anyway) then fix ownership at end.
+if [ -d "$REL/.next/standalone" ]; then
+    echo "  Next.js standalone detected — optimizing..."
+    # copy static assets into standalone (as root, then fix perms)
+    if [ -d "$REL/.next/static" ]; then
+        mkdir -p "$REL/.next/standalone/.next/static"
+        cp -a "$REL/.next/static/." "$REL/.next/standalone/.next/static/"
+    fi
+    if [ -d "$REL/public" ] && [ ! -d "$REL/.next/standalone/public" ]; then
+        cp -a "$REL/public" "$REL/.next/standalone/public"
+    fi
+    # remove the full node_modules (standalone has its own)
+    rm -rf "$REL/node_modules"
+    # remove .next except standalone (static already copied)
+    find "$REL/.next" -maxdepth 1 -mindepth 1 ! -name 'standalone' -exec rm -rf {} + 2>/dev/null || true
+    # fix ownership for the site user
+    chown -R "$SITE_USER:$SITE_USER" "$REL"
+    echo "  optimized: $(du -sh "$REL" | cut -f1) (was ~600MB with full node_modules)"
+fi
+
 echo "[3/6] Installing systemd unit app-$SITE_ID..."
 # Map the first startCmd token to the absolute binary of the chosen node version
 first_tok="${START%% *}"; rest="${START#"$first_tok"}"; rest="${rest#"${rest%%[! ]*}"}"
