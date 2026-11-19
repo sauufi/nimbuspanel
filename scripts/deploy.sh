@@ -64,3 +64,28 @@ sleep 2
 
 systemctl is-active panel || { journalctl -u panel --no-pager -n 30; die "panel.service is not active"; }
 info "Done: panel active on 127.0.0.1:3444 — install the nginx vhost (infra/panel-vhost.example.conf)"
+
+# ---- Auto-cleanup: prevent disk from filling up on small VPS ----
+info "Cleaning up build artifacts..."
+
+# npm cache (biggest offender: 1.8GB per deploy)
+npm cache clean --force 2>/dev/null || true
+
+# node_modules from build source (only needed during build, not after)
+rm -rf "$REPO_ROOT/frontend/node_modules" "$REPO_ROOT/backend/node_modules"
+
+# old releases — keep only the 2 newest
+RELEASE_DIR="/opt/panel/backends/releases"
+if [ -d "$RELEASE_DIR" ]; then
+    (cd "$RELEASE_DIR" && ls -1 | sort | head -n -2 | while read -r old; do
+        rm -rf "$RELEASE_DIR/$old"
+    done)
+fi
+
+# apt cache
+apt-get clean 2>/dev/null || true
+
+# journal logs
+journalctl --vacuum-size=20M 2>/dev/null || true
+
+info "Cleanup done. Disk: $(df -h / | awk 'NR==2 {print $4}') free"
