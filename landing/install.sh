@@ -45,8 +45,28 @@ else
 fi
 
 case "$OS" in
-    "Ubuntu 24.04" | "Ubuntu 22.04" | "Debian 12") info "OS: $OS" ;;
-    *) warn "OS '$OS' is untested (Ubuntu 24.04 / Debian 12 recommended). Continuing anyway..." ;;
+    ubuntu:*|Ubuntu:*)
+        OS_MAJOR=$(echo "$VERSION_ID" | cut -d. -f1)
+        if [ "$OS_MAJOR" -ge 22 ]; then
+            info "OS: $PRETTY_NAME"
+        else
+            fail "Ubuntu $VERSION_ID not supported (minimum 22.04)"
+        fi
+        ;;
+    debian:*|Debian:*)
+        if [ "${VERSION_ID%%.*}" -ge 12 ]; then
+            info "OS: $PRETTY_NAME"
+        else
+            fail "Debian $VERSION_ID not supported (minimum 12)"
+        fi
+        ;;
+    *)
+        if command -v apt-get >/dev/null 2>&1; then
+            warn "OS '$PRETTY_NAME' not officially supported (Debian/Ubuntu derivatives may work)"
+        else
+            fail "This system doesn't use apt — NimbusPanel requires Ubuntu 22.04+ or Debian 12+"
+        fi
+        ;;
 esac
 
 RAM_MB=$(awk '/MemTotal/ {print int($2/1024)}' /proc/meminfo)

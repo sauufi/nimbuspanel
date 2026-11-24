@@ -56,7 +56,23 @@ bash scripts/deploy.sh
 | RAM | 848 MB | 2 GB |
 | Disk | 8 GB | 20 GB |
 | CPU | 1 core | 2 cores |
-| OS | Ubuntu 24.04 / Debian 12 | Ubuntu 24.04 |
+| OS | See below | Ubuntu 24.04 LTS |
+
+### Supported Operating Systems
+
+| OS | Version | Codename | Status |
+|---|---|---|---|
+| **Ubuntu** | 22.04 LTS | jammy | ✅ Fully tested |
+| **Ubuntu** | 24.04 LTS | noble | ✅ Fully tested |
+| **Ubuntu** | 24.10 | oracular | ✅ Auto-detected (sury fallback → noble) |
+| **Ubuntu** | 25.04+ | future | ⚠️ Should work (sury fallback → noble) |
+| **Debian** | 12 | bookworm | ✅ Fully tested |
+| **Debian** | 13 | trixie | ✅ Auto-detected |
+| **Debian** | 14+ | future | ⚠️ Should work (sury fallback → trixie) |
+
+**How it works:** The installer detects your OS codename and checks if [packages.sury.org](https://packages.sury.org/php/dists/) has PHP packages for it. If your codename isn't available yet (brand-new release), it automatically falls back to the nearest LTS codename. This means future Ubuntu/Debian releases work out-of-the-box without code changes.
+
+**Not supported:** CentOS, RHEL, Fedora, Alpine, Arch (no apt/dpkg).
 
 ## 🏗 Architecture
 

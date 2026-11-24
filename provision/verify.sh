@@ -18,8 +18,8 @@ check() { local d="$1"; shift; if "$@" >/dev/null 2>&1; then ok "$d"; else bad "
 
 echo "== System =="
 check "Running as root" test "$(id -u)" -eq 0
-check "Supported OS (Ubuntu 22.04/24.04, Debian 12)" \
-    grep -Eq 'PRETTY_NAME="(Ubuntu (22|24)\.04|Debian GNU/Linux 12)' /etc/os-release
+check "Supported OS (Ubuntu 22.04+, Debian 12+)" \
+    bash -c '. /etc/os-release; case "$ID" in ubuntu) [ "${VERSION_ID%%.*}" -ge 22 ];; debian) [ "${VERSION_ID%%.*}" -ge 12 ];; *) false;; esac'
 check "Unattended-upgrades enabled" test -f /etc/apt/apt.conf.d/20auto-upgrades
 check "Cron active" systemctl is-active cron
 

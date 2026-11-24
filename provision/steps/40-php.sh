@@ -2,10 +2,11 @@
 # 40-php.sh — PHP multi-versi via FPM, repo packages.sury.org
 # Tiap versi punya service php<X>-fpm sendiri; pool per situs ditambah panel fase 1.
 #
-# The sury repo is used for both Debian AND Ubuntu (noble/jammy available there).
-# The ondrej/php Launchpad PPA is being phased out — and add-apt-repository
-# needs api.launchpad.net which often times out on some VPS networks,
-# so the repo is written manually + the key is fetched from the same host as the packages.
+# Uses PHP_REPO_CODENAME from lib.sh (dynamically resolved):
+#   - Direct match if OS codename is available at sury.org
+#   - Fallback to nearest LTS codename for newer releases
+# This supports Debian 12+ (bookworm/trixie) and Ubuntu 22.04+ (jammy/noble)
+# including future releases that haven't been added to sury yet.
 set -euo pipefail
 STEP_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 . "$STEP_ROOT/config.sh"
@@ -14,16 +15,16 @@ STEP_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck disable=SC2206
 PHP_LIST=(${PANEL_PHP:-${PHP_VERSIONS[*]}})
 
-case "${OS_CODENAME:-}" in
-    bookworm | trixie | bullseye | noble | jammy) ;;
-    *) die "OS codename '$OS_CODENAME' not available at packages.sury.org/php (check https://packages.sury.org/php/dists/)" ;;
-esac
+# PHP_REPO_CODENAME is set by lib.sh detect_os() — already validated with fallback
+if [ -z "${PHP_REPO_CODENAME:-}" ]; then
+    die "PHP_REPO_CODENAME not set — lib.sh detect_os() must run first"
+fi
 
 KEYRING="/usr/share/keyrings/deb.sury.org-php.gpg"
 if [ ! -f "$KEYRING" ]; then
     curl -fsSL --retry 3 https://packages.sury.org/php/apt.gpg -o "$KEYRING"
 fi
-echo "deb [signed-by=$KEYRING] https://packages.sury.org/php/ $OS_CODENAME main" \
+echo "deb [signed-by=$KEYRING] https://packages.sury.org/php/ $PHP_REPO_CODENAME main" \
     > /etc/apt/sources.list.d/sury-php.list
 
 apt-get -o Acquire::Retries=3 update -qq
