@@ -53,10 +53,47 @@ chown -R "$SITE_USER:$SITE_USER" "$SITE_ROOT"
 RUN() { runuser -u "$SITE_USER" -- env PATH="$NODEBIN:$PATH" "$@"; }
 
 echo "[1/6] Fetching code (repo: $REPO, branch: $BRANCH)..."
-if [ ! -d "$SITE_ROOT/repo/.git" ]; then
-    RUN git clone "$REPO" "$SITE_ROOT/repo" >/dev/null 2>&1 || fail "git clone failed (public repo/valid path?)"
+
+# --- Private repo support: inject GitHub token if configured ---
+GIT_TOKEN_FILE="/opt/panel/etc/git_token"
+CLONE_URL="$REPO"
+
+if [ -s "$GIT_TOKEN_FILE" ] && [[ "$REPO" == https://github.com/* ]]; then
+    GIT_TOKEN="$(cat "$GIT_TOKEN_FILE")"
+    # Inject token: https://github.com/user/repo.git → https://x-access-token:TOKEN@github.com/user/repo.git
+    CLONE_URL="${REPO/https:\/\//https:\/\/x-access-token:${GIT_TOKEN}@}"
+    echo "  (private repo: using GitHub token)"
 fi
-RUN git -C "$SITE_ROOT/repo" fetch origin --prune >/dev/null 2>&1 || fail "git fetch failed"
+
+if [ ! -d "$SITE_ROOT/repo/.git" ]; then
+    RUN git clone "$CLONE_URL" "$SITE_ROOT/repo" >/dev/null 2>&1 || {
+        # If clone failed with token, try without (might be public)
+        if [ "$CLONE_URL" != "$REPO" ]; then
+            RUN git clone "$REPO" "$SITE_ROOT/repo" >/dev/null 2>&1 || \
+                fail "git clone failed (check token in Settings → Git Credentials, or repo URL)"
+        else
+            fail "git clone failed (public repo/valid path?)"
+        fi
+    }
+fi
+
+# For fetch, inject token too (private repos need it every time)
+FETCH_URL="$CLONE_URL"
+if [ ! -d "$SITE_ROOT/repo/.git" ]; then
+    RUN git -C "$SITE_ROOT/repo" fetch origin --prune >/dev/null 2>&1 || fail "git fetch failed"
+else
+    # Update remote URL if token changed (idempotent)
+    CURRENT_URL="$(RUN git -C "$SITE_ROOT/repo" remote get-url origin 2>/dev/null || echo "")"
+    if [ "$CURRENT_URL" != "$FETCH_URL" ] && [ "$FETCH_URL" != "$REPO" ]; then
+        RUN git -C "$SITE_ROOT/repo" remote set-url origin "$FETCH_URL" >/dev/null 2>&1 || true
+    fi
+    RUN git -C "$SITE_ROOT/repo" fetch origin --prune >/dev/null 2>&1 || {
+        # Try with fresh URL if fetch fails
+        RUN git -C "$SITE_ROOT/repo" remote set-url origin "$FETCH_URL" >/dev/null 2>&1 || true
+        RUN git -C "$SITE_ROOT/repo" fetch origin --prune >/dev/null 2>&1 || fail "git fetch failed (check token or branch)"
+    }
+fi
+
 RUN git -C "$SITE_ROOT/repo" checkout -f "$BRANCH" >/dev/null 2>&1 || fail "branch $BRANCH not found"
 RUN git -C "$SITE_ROOT/repo" reset --hard "origin/$BRANCH" >/dev/null 2>&1 \
     || RUN git -C "$SITE_ROOT/repo" reset --hard "$BRANCH" >/dev/null 2>&1 \

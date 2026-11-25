@@ -33,6 +33,59 @@ function helperError(res: { code: number; stdout: string; stderr: string }): str
 }
 
 export async function hostRoutes(app: FastifyInstance): Promise<void> {
+  // ---- Git Credentials (GitHub token for private repos) ----
+
+  app.get('/api/git-token', { preHandler: [requireAuth] }, async () => {
+    const res = await sudo(['panel-git-token', 'get'])
+    if (res.code !== 0) return { configured: false, hint: '' }
+    const lines = res.stdout.trim().split('\n')
+    const hint = lines.find((l) => l.startsWith('hint: '))?.slice(6) ?? ''
+    const configured = lines.some((l) => l.includes('configured: yes'))
+    return { configured, hint }
+  })
+
+  app.put('/api/git-token', { preHandler: [requireAuth] }, async (req, reply) => {
+    const Body = z
+      .object({
+        token: z.string().regex(/^(ghp_|github_pat_|gho_|ghu_|ghs_|ghr_)[A-Za-z0-9_]+$/, 'Invalid GitHub token format (must start with ghp_ or github_pat_)'),
+      })
+      .safeParse(req.body)
+    if (!Body.success) {
+      return reply.code(400).send({ error: Body.error.issues[0]?.message ?? 'invalid token' })
+    }
+
+    const res = await sudo(['panel-git-token', 'set', Body.data.token])
+    if (res.code !== 0) return reply.code(500).send({ error: helperError(res) })
+
+    // Validate token against GitHub API
+    const check = await sudo(['panel-git-token', 'check'])
+    if (check.code !== 0) {
+      // Token saved but invalid — warn but keep it (might be network issue)
+      audit('git-token.saved-invalid', { hint: Body.data.token.slice(0, 7) + '...' })
+      return {
+        ok: true,
+        warning: 'Token saved but could not verify with GitHub API. It will be used on next deploy.',
+      }
+    }
+
+    audit('git-token.saved', { hint: Body.data.token.slice(0, 7) + '...' })
+    return { ok: true, message: 'GitHub token saved and verified' }
+  })
+
+  app.delete('/api/git-token', { preHandler: [requireAuth] }, async (_req, reply) => {
+    const res = await sudo(['panel-git-token', 'remove'])
+    if (res.code !== 0) return reply.code(500).send({ error: helperError(res) })
+    audit('git-token.removed', {})
+    return { ok: true }
+  })
+
+  app.post('/api/git-token/check', { preHandler: [requireAuth] }, async (_req, reply) => {
+    const res = await sudo(['panel-git-token', 'check'])
+    if (res.code !== 0) return reply.code(400).send({ error: helperError(res) })
+    return { ok: true, message: 'Token is valid' }
+  })
+
+  // ---- Panel hostname settings ----
   app.get('/api/panel-host', { preHandler: [requireAuth] }, async () => {
     const res = await sudo(['panel-hostname', 'status'])
     return parseStatus(res.stdout)

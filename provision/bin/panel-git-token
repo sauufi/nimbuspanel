@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+# ============================================================
+# panel-git-token — manage GitHub access token for private repos.
+# Invoked via sudo by user 'panel'.
+#
+#   panel-git-token set <token>     → save token (from stdin or arg)
+#   panel-git-token get             → print masked token hint
+#   panel-git-token remove          → delete stored token
+#   panel-git-token check           → test token against GitHub API
+#
+# Token stored at /opt/panel/etc/git_token (root:panel 0640).
+# Used by panel-node-deploy to clone private repos.
+# ============================================================
+set -euo pipefail
+
+TOKEN_FILE="/opt/panel/etc/git_token"
+
+fail() { echo "panel-git-token: $*" >&2; exit 1; }
+
+mkdir -p "$(dirname "$TOKEN_FILE")"
+touch "$TOKEN_FILE"
+chown root:panel "$TOKEN_FILE"
+chmod 0640 "$TOKEN_FILE"
+
+ACTION="${1:-}"
+
+case "$ACTION" in
+    set)
+        TOKEN="${2:-}"
+        # If no arg, read from stdin
+        if [ -z "$TOKEN" ]; then
+            TOKEN="$(cat)"
+        fi
+        [ -n "$TOKEN" ] || fail "token is required"
+        [ "${#TOKEN}" -le 255 ] || fail "token too long (max 255 chars)"
+        # Basic format check (github PAT: ghp_, github_pat_, or fine-grained)
+        [[ "$TOKEN" =~ ^(ghp_|github_pat_|gho_|ghu_|ghs_|ghr_)[A-Za-z0-9_]+$ ]] || \
+            fail "invalid token format (expected ghp_... or github_pat_...)"
+        printf '%s' "$TOKEN" > "$TOKEN_FILE"
+        echo "OK: GitHub token saved"
+        ;;
+    get)
+        if [ -s "$TOKEN_FILE" ]; then
+            TOKEN="$(cat "$TOKEN_FILE")"
+            # Mask: show first 7 and last 4 chars
+            if [ "${#TOKEN}" -gt 12 ]; then
+                echo "hint: ${TOKEN:0:7}...${TOKEN: -4}"
+            else
+                echo "hint: ${TOKEN:0:3}..."
+            fi
+            echo "configured: yes"
+        else
+            echo "configured: no"
+        fi
+        ;;
+    remove)
+        rm -f "$TOKEN_FILE"
+        echo "OK: token removed"
+        ;;
+    check)
+        TOKEN="$(cat "$TOKEN_FILE" 2>/dev/null || true)"
+        [ -n "$TOKEN" ] || fail "no token configured"
+        RESULT="$(curl -s -o /dev/null -w '%{http_code}' \
+            -H "Authorization: Bearer $TOKEN" \
+            https://api.github.com/user 2>/dev/null || echo "000")"
+        case "$RESULT" in
+            200) echo "OK: token is valid" ;;
+            401) fail "token is invalid or expired" ;;
+            *)   fail "cannot reach GitHub API (HTTP $RESULT)" ;;
+        esac
+        ;;
+    *)
+        fail "unknown action: $ACTION (use set|get|remove|check)"
+        ;;
+esac
