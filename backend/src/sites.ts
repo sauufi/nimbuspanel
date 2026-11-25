@@ -11,7 +11,7 @@ import { convertHtaccess } from './htaccess'
 import { notify } from './notify'
 
 const DOMAIN_RE = /^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$/
-const CMD_RE = /^[a-zA-Z0-9 ./_:=@-]*$/ // charset sama dengan helper — tanpa ; | & $ ` >
+const CMD_RE = /^[a-zA-Z0-9 ./_:=@&>-]*$/ // allows && for command chaining; blocks ; | $ ` ( )
 const BRANCH_RE = /^[a-zA-Z0-9._/-]+$/
 const REPO_RE = /^(https:\/\/[a-zA-Z0-9./_:~@-]+|\/[a-zA-Z0-9./_-]+)$/
 

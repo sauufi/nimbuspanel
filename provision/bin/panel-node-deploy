@@ -17,7 +17,8 @@ set -euo pipefail
 
 DOMAIN_RE='^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$'
 BRANCH_RE='^[a-zA-Z0-9._/-]+$'
-CMD_RE='^[a-zA-Z0-9 ./_:=@-]*$'          # build/start charset: no ; | & $ ` >
+CMD_RE='^[a-zA-Z0-9 ./_:=@&>-]*$'          # build/start charset: allows && for chaining
+                                                             # still blocks ; | $ ` ( ) backtick
 REPO_RE='^(https://[a-zA-Z0-9./_:~@-]+|/[a-zA-Z0-9./_-]+)$'
 
 DOMAIN="${1:-}"; SITE_ID="${2:-}"; REPO="${3:-}"; BRANCH="${4:-}"
@@ -105,13 +106,31 @@ REL="$SITE_ROOT/releases/$TS"
 mkdir -p "$REL"
 chown "$SITE_USER:$SITE_USER" "$REL"
 RUN cp -a "$SITE_ROOT/repo/." "$REL/"
-# install deps + optional build + strip devDependencies after build
+# install deps (prefer npm ci for exact lockfile + all platform binaries),
+# run optional build, then strip devDependencies.
+# Fail FAST on any error — don't continue to health check if build fails.
 RUN bash -c "cd '$REL' && [ -f package.json ] || { echo 'package.json not found in repo' >&2; exit 1; }
-npm install --no-audit --no-fund 2>&1 | tail -2
-${BUILD:+$BUILD
-}
-npm prune --omit=dev" || fail "build failed"
+if [ -f package-lock.json ]; then
+    npm ci --no-audit --no-fund 2>&1 | tail -3
+else
+    npm install --no-audit --no-fund 2>&1 | tail -3
+fi
+# FIX: lockfiles created on other OS may miss linux platform binaries.
+# Install them explicitly (lightningcss, swc, esbuild are the common offenders).
+npm install lightningcss-linux-x64-gnu @tailwindcss/oxide-linux-x64-gnu --no-save --no-audit --no-fund 2>/dev/null || true
+" || fail "npm install failed (check package.json / lockfile compatibility)"
 RUN ln -sfn ../shared/.env "$REL/.env"
+
+# Run build command if specified — MUST succeed or we abort immediately
+if [ -n "$BUILD" ]; then
+    RUN bash -c "cd '$REL' && $BUILD" || {
+        rm -rf "$REL"
+        fail "BUILD FAILED — fix build errors and retry"
+    }
+fi
+
+# Strip devDependencies (only if build succeeded)
+RUN bash -c "cd '$REL' && npm prune --omit=dev 2>&1 | tail -1" || true
 
 # Next.js standalone optimization: if .next/standalone exists, remove
 # the full node_modules (standalone has its own minimal set) and copy
