@@ -284,7 +284,7 @@ Host:     ${wpCreds.credentials.dbHost}`}</pre>
           <section className="space-y-4 rounded-xl border border-slate-200 bg-white p-6 shadow-sm">
             <h2 className="text-sm font-semibold text-slate-900">Deploy Settings</h2>
             <div className="grid gap-4 sm:grid-cols-2">
-              <Field label="Repository (public https or local path)">
+              <Field label="Repository URL (public or private — set token in Settings → Git Credentials)">
                 <input className={inputCls} value={repoUrl} onChange={(e) => setRepoUrl(e.target.value)} placeholder="https://github.com/user/app.git" />
               </Field>
               <Field label="Branch"><input className={inputCls} value={branch} onChange={(e) => setBranch(e.target.value)} placeholder="main" /></Field>
