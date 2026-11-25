@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# panel-disk-usage — per-site disk usage in MB.
+#   sudo panel-disk-usage
+# Output: domain|sizeMb per line
+set -euo pipefail
+
+for d in /var/www/*/; do
+    domain="$(basename "$d")"
+    case "$domain" in
+        html | panel-challenge | panel-webmail | *.removed-*) continue ;;
+    esac
+    [ -d "$d" ] || continue
+    SIZE=$(du -sm "$d" 2>/dev/null | cut -f1)
+    echo "${domain}|${SIZE}"
+done

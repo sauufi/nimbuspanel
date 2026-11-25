@@ -14,8 +14,14 @@ interface Site {
   created_at: string
 }
 
+interface DiskUsage {
+  domain: string
+  sizeMb: string
+}
+
 export default function Sites() {
   const [sites, setSites] = useState<Site[] | null>(null)
+  const [diskUsage, setDiskUsage] = useState<Record<string, string>>({})
   const [phpVersions, setPhpVersions] = useState<string[]>([])
   const [error, setError] = useState('')
   const [notice, setNotice] = useState('')
@@ -29,12 +35,16 @@ export default function Sites() {
 
   async function load() {
     try {
-      const [s, o] = await Promise.all([
+      const [s, o, d] = await Promise.all([
         api<{ sites: Site[] }>('/sites'),
         api<{ phpVersions: string[] }>('/sites/options'),
+        api<{ sites: DiskUsage[] }>('/sites/disk-usage').catch(() => ({ sites: [] as DiskUsage[] })),
       ])
       setSites(s.sites)
       setPhpVersions(o.phpVersions)
+      const usageMap: Record<string, string> = {}
+      for (const u of d.sites) usageMap[u.domain] = u.sizeMb
+      setDiskUsage(usageMap)
       if (o.phpVersions.length > 0 && !phpVersion) setPhpVersion(o.phpVersions[o.phpVersions.length - 1])
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to load sites')
@@ -148,6 +158,7 @@ export default function Sites() {
               <th className="px-5 py-3">Domain</th>
               <th className="px-5 py-3">Type</th>
               <th className="px-5 py-3">Runtime</th>
+              <th className="px-5 py-3">Disk</th>
               <th className="px-5 py-3">SSL</th>
               <th className="px-5 py-3">Created</th>
             </tr>
@@ -173,6 +184,20 @@ export default function Sites() {
                   {s.type === 'php' ? `PHP ${s.php_version}` : `port ${s.node_port}`}
                 </td>
                 <td className="px-5 py-3.5">
+                  {diskUsage[s.domain] ? (
+                    <span className={`text-xs font-medium ${
+                      Number(diskUsage[s.domain]) > 500 ? 'text-red-600' :
+                      Number(diskUsage[s.domain]) > 100 ? 'text-amber-600' : 'text-slate-500'
+                    }`}>
+                      {Number(diskUsage[s.domain]) >= 1000
+                        ? `${(Number(diskUsage[s.domain]) / 1024).toFixed(1)} GB`
+                        : `${diskUsage[s.domain]} MB`}
+                    </span>
+                  ) : (
+                    <span className="text-xs text-slate-300">—</span>
+                  )}
+                </td>
+                <td className="px-5 py-3.5">
                   {s.ssl_enabled ? (
                     <span className="inline-flex items-center gap-1 text-xs font-medium text-emerald-700"><Lock className="h-3.5 w-3.5" /> active</span>
                   ) : (
@@ -184,7 +209,7 @@ export default function Sites() {
             ))}
             {sites !== null && sites.length === 0 && (
               <tr>
-                <td colSpan={5} className="px-5 py-12 text-center text-slate-400">
+                <td colSpan={6} className="px-5 py-12 text-center text-slate-400">
                   <Server className="mx-auto mb-2 h-8 w-8 text-slate-200" />
                   No sites yet — click “Add Site”.
                 </td>

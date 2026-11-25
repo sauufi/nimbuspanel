@@ -212,8 +212,11 @@ if [ -z "$ok" ]; then
     exit 1
 fi
 
-echo "[6/6] Pruning old releases (keeping 5)..."
+echo "[6/6] Pruning old releases..."
+# Read per-site retention from panel-node-releases helper (default 5)
+RETENTION_COUNT="$(/opt/panel/bin/panel-node-releases get-retention "$DOMAIN" 2>/dev/null || echo 5)"
 cd "$SITE_ROOT/releases"
-ls -1 | sort | head -n -5 | while read -r old; do rm -rf "$SITE_ROOT/releases/$old"; done
+ls -1 | sort | head -n -"$RETENTION_COUNT" | while read -r old; do rm -rf "$SITE_ROOT/releases/$old"; done
+echo "  kept $RETENTION_COUNT releases"
 
 echo "OK: $DOMAIN deployed (release $TS, unit app-$SITE_ID active)"

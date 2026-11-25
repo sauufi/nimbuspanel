@@ -3,7 +3,7 @@ import crypto from 'node:crypto'
 import { spawn } from 'node:child_process'
 import type { FastifyInstance, FastifyReply } from 'fastify'
 import { z } from 'zod'
-import { allocateNodePort, audit, db, type SiteRow } from './db'
+import { allocateNodePort, audit, db, getMeta, setMeta, type SiteRow } from './db'
 import { sudo, tail } from './exec'
 import { requireAuth } from './auth'
 import { installedPhpVersions } from './system'
@@ -48,6 +48,11 @@ const NodeSettings = z.object({
 
 function getSite(id: number): SiteRow | undefined {
   return db.prepare('SELECT * FROM sites WHERE id = ?').get(id) as SiteRow | undefined
+}
+
+function getRetention(siteId: number): number {
+  const v = Number(getMeta(`release_retention_${siteId}`, '5'))
+  return Number.isFinite(v) && v >= 1 && v <= 20 ? v : 5
 }
 
 function helperError(res: { code: number; stdout: string; stderr: string }): string {
@@ -217,6 +222,82 @@ export async function sitesRoutes(app: FastifyInstance): Promise<void> {
     }
     audit('site.rollback', { domain: site.domain })
     return { ok: true, output: tail(res.stdout) }
+  })
+
+  // ---- Release Management (node sites) ----
+
+  app.get('/api/sites/:id/releases', { preHandler: [requireAuth] }, async (req, reply) => {
+    const site = getSite(Number((req.params as { id: string }).id))
+    if (!site || site.type !== 'node') return reply.code(404).send({ error: 'Node site not found' })
+
+    // List releases with sizes via helper
+    const res = await sudo(['panel-node-releases', 'list', site.domain])
+    if (res.code !== 0) return reply.code(500).send({ error: helperError(res) })
+
+    const releases: { name: string; sizeMb: string; date: string; active: boolean }[] = []
+    let currentRelease = ''
+    try {
+      currentRelease = fs.readlinkSync(`/var/www/${site.domain}/current`).split('/').pop() ?? ''
+    } catch { /* no deploy yet */ }
+
+    for (const line of res.stdout.trim().split('\n').filter(Boolean)) {
+      const [name, size, date] = line.split('|')
+      if (name) {
+        releases.push({
+          name,
+          sizeMb: size || '0',
+          date: date || '',
+          active: name === currentRelease,
+        })
+      }
+    }
+    return { releases, currentRelease, retention: getRetention(site.id) }
+  })
+
+  app.delete('/api/sites/:id/releases/:name', { preHandler: [requireAuth] }, async (req, reply) => {
+    const site = getSite(Number((req.params as { id: string }).id))
+    if (!site || site.type !== 'node') return reply.code(404).send({ error: 'Node site not found' })
+    const relName = String((req.params as { name: string }).name)
+
+    if (!/^\d{8}-\d{6}$/.test(relName)) return reply.code(400).send({ error: 'Invalid release name' })
+
+    // Prevent deleting active release
+    let currentRelease = ''
+    try {
+      currentRelease = fs.readlinkSync(`/var/www/${site.domain}/current`).split('/').pop() ?? ''
+    } catch { /* */ }
+    if (relName === currentRelease) return reply.code(400).send({ error: 'Cannot delete the active release' })
+
+    const res = await sudo(['panel-node-releases', 'delete', site.domain, relName])
+    if (res.code !== 0) return reply.code(500).send({ error: helperError(res) })
+    audit('site.release.delete', { domain: site.domain, release: relName })
+    return { ok: true }
+  })
+
+  app.put('/api/sites/:id/releases/retention', { preHandler: [requireAuth] }, async (req, reply) => {
+    const site = getSite(Number((req.params as { id: string }).id))
+    if (!site || site.type !== 'node') return reply.code(404).send({ error: 'Node site not found' })
+
+    const Body = z.object({ retention: z.number().int().min(1).max(20) }).safeParse(req.body)
+    if (!Body.success) return reply.code(400).send({ error: 'Retention must be 1-20' })
+
+    const res = await sudo(['panel-node-releases', 'retention', site.domain, String(Body.data.retention)])
+    if (res.code !== 0) return reply.code(500).send({ error: helperError(res) })
+    audit('site.release.retention', { domain: site.domain, retention: Body.data.retention })
+    return { ok: true, retention: Body.data.retention }
+  })
+
+  // ---- Disk Usage (all sites) ----
+
+  app.get('/api/sites/disk-usage', { preHandler: [requireAuth] }, async () => {
+    const res = await sudo(['panel-disk-usage'])
+    if (res.code !== 0) return { sites: [] }
+    const usage: { domain: string; sizeMb: string }[] = []
+    for (const line of res.stdout.trim().split('\n').filter(Boolean)) {
+      const [domain, size] = line.split('|')
+      if (domain && size) usage.push({ domain, sizeMb: size })
+    }
+    return { sites: usage }
   })
 
   app.get('/api/sites/:id/env', { preHandler: [requireAuth] }, async (req, reply) => {

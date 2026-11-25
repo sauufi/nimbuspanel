@@ -316,6 +316,7 @@ Host:     ${wpCreds.credentials.dbHost}`}</pre>
             {deployOutput && <pre className="max-h-64 overflow-auto rounded-lg border border-slate-200 bg-slate-950 p-4 text-xs leading-relaxed text-slate-200">{deployOutput}</pre>}
           </section>
           <WebhookBox siteKey={site.id} secret={site.deploy_secret ?? null} onRotated={load} busy={busy !== null} />
+          <ReleaseManager siteKey={site.id} />
         </div>
       )}
 
@@ -451,6 +452,113 @@ function RulesEditor({ siteKey }: { siteKey: number }) {
       <button onClick={save} disabled={busy} className="rounded-lg bg-emerald-600 px-4 py-2.5 text-sm font-semibold text-white hover:bg-emerald-500 disabled:opacity-50">
         {busy ? 'Saving…' : 'Save Rules'}
       </button>
+    </section>
+  )
+}
+
+function ReleaseManager({ siteKey }: { siteKey: number }) {
+  const [releases, setReleases] = useState<{ name: string; sizeMb: string; date: string; active: boolean }[]>([])
+  const [retention, setRetention] = useState(5)
+  const [error, setError] = useState('')
+  const [notice, setNotice] = useState('')
+  const [busy, setBusy] = useState(false)
+
+  async function load() {
+    try {
+      const res = await api<{ releases: typeof releases; retention: number }>(`/sites/${siteKey}/releases`)
+      setReleases(res.releases ?? [])
+      setRetention(res.retention ?? 5)
+      setError('')
+    } catch { /* site might not have releases yet */ }
+  }
+
+  useEffect(() => { load() }, [siteKey])
+
+  async function del(name: string) {
+    if (!confirm(`Delete release ${name}? This cannot be undone.`)) return
+    setBusy(true); setError(''); setNotice('')
+    try {
+      await api(`/sites/${siteKey}/releases/${name}`, { method: 'DELETE' })
+      setNotice(`Release ${name} deleted`)
+      await load()
+    } catch (err) { setError(err instanceof Error ? err.message : 'Failed') }
+    finally { setBusy(false) }
+  }
+
+  async function saveRetention(e: React.FormEvent) {
+    e.preventDefault()
+    setBusy(true); setError(''); setNotice('')
+    try {
+      await api(`/sites/${siteKey}/releases/retention`, { method: 'PUT', body: JSON.stringify({ retention }) })
+      setNotice(`Retention set to ${retention}`)
+    } catch (err) { setError(err instanceof Error ? err.message : 'Failed') }
+    finally { setBusy(false) }
+  }
+
+  const totalMb = releases.reduce((sum, r) => sum + Number(r.sizeMb), 0)
+
+  return (
+    <section className="space-y-3 rounded-xl border border-slate-200 bg-white p-6 shadow-sm">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <h2 className="text-sm font-semibold text-slate-900">Releases</h2>
+        <span className="text-xs text-slate-400">{releases.length} releases · {totalMb} MB total</span>
+      </div>
+
+      {error && <p className="rounded-lg bg-red-50 px-3 py-2 text-sm text-red-700">{error}</p>}
+      {notice && <p className="rounded-lg bg-emerald-50 px-3 py-2 text-sm text-emerald-700">{notice}</p>}
+
+      {releases.length > 0 && (
+        <div className="overflow-hidden rounded-lg border border-slate-200">
+          <table className="w-full text-sm">
+            <thead className="border-b border-slate-200 bg-slate-50 text-left text-[11px] uppercase tracking-wide text-slate-400">
+              <tr>
+                <th className="px-3 py-2">Release</th>
+                <th className="px-3 py-2">Size</th>
+                <th className="px-3 py-2">Date</th>
+                <th className="px-3 py-2 text-right">Actions</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-slate-100">
+              {releases.map((r) => (
+                <tr key={r.name} className={r.active ? 'bg-emerald-50/50' : 'hover:bg-slate-50'}>
+                  <td className="px-3 py-2.5 font-mono text-xs">
+                    {r.active && <span className="mr-1.5 text-emerald-600">●</span>}
+                    {r.name}
+                    {r.active && <span className="ml-1.5 rounded-full bg-emerald-100 px-1.5 py-0.5 text-[10px] font-medium text-emerald-700">active</span>}
+                  </td>
+                  <td className="px-3 py-2.5 text-xs text-slate-500">{r.sizeMb} MB</td>
+                  <td className="px-3 py-2.5 text-xs text-slate-400">{r.date}</td>
+                  <td className="px-3 py-2.5 text-right">
+                    {!r.active && (
+                      <button
+                        onClick={() => del(r.name)}
+                        disabled={busy}
+                        className="rounded-lg border border-red-100 bg-red-50 px-2 py-1 text-xs font-medium text-red-600 transition hover:bg-red-100 disabled:opacity-50"
+                      >Delete</button>
+                    )}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      <form onSubmit={saveRetention} className="flex flex-wrap items-end gap-3 border-t border-slate-100 pt-3">
+        <div>
+          <label className="mb-1 block text-xs font-medium text-slate-600">Keep releases (1-20)</label>
+          <input
+            type="number" min={1} max={20}
+            className="w-20 rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm outline-none focus:border-emerald-500"
+            value={retention}
+            onChange={(e) => setRetention(Number(e.target.value))}
+          />
+        </div>
+        <button disabled={busy} className="rounded-lg border border-slate-300 bg-white px-4 py-2 text-sm font-medium text-slate-700 transition hover:bg-slate-50 disabled:opacity-50">
+          {busy ? 'Saving…' : 'Save'}
+        </button>
+        <p className="text-xs text-slate-400">Old releases are automatically pruned after each deploy.</p>
+      </form>
     </section>
   )
 }
