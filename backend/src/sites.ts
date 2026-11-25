@@ -583,6 +583,71 @@ export async function sitesRoutes(app: FastifyInstance): Promise<void> {
     return { ok: true }
   })
 
+  // ---- Site Transfer (export/import) ----
+
+  app.get('/api/sites/:id/export', { preHandler: [requireAuth] }, async (req, reply) => {
+    const site = getSite(Number((req.params as { id: string }).id))
+    if (!site) return reply.code(404).send({ error: 'Site not found' })
+
+    const res = await sudo(['panel-site-export', site.domain], { timeoutMs: 300_000 })
+    if (res.code !== 0) {
+      audit('site.export.failed', { domain: site.domain, error: helperError(res) })
+      return reply.code(500).send({ error: helperError(res) })
+    }
+    audit('site.export', { domain: site.domain })
+    reply.header('content-disposition', `attachment; filename="${site.domain}-export.tar.gz"`)
+    reply.header('content-type', 'application/gzip')
+    return res.stdout
+  })
+
+  app.post('/api/sites/import', { preHandler: [requireAuth] }, async (req, reply) => {
+    const Body = z
+      .object({
+        bundleBase64: z.string().min(10).max(500 * 1024 * 1024), // up to ~350MB base64
+        newDomain: z.string().regex(DOMAIN_RE).optional(),
+      })
+      .safeParse(req.body)
+    if (!Body.success) {
+      return reply.code(400).send({ error: 'Bundle data required (base64 encoded .tar.gz)' })
+    }
+
+    // Write bundle to temp file
+    const tmpFile = `/tmp/panel-import-${Date.now()}.tar.gz`
+    const { execSync } = await import('node:child_process')
+    try {
+      execSync(`base64 -d > ${tmpFile}`, { input: Body.data.bundleBase64, timeout: 60_000 })
+    } catch {
+      return reply.code(400).send({ error: 'Invalid base64 bundle data' })
+    }
+
+    const args = ['panel-site-import', tmpFile]
+    if (Body.data.newDomain) args.push('--domain', Body.data.newDomain)
+
+    const res = await sudo(args, { timeoutMs: 300_000, input: '' })
+
+    // Cleanup temp file
+    const { unlinkSync } = await import('node:fs')
+    try { unlinkSync(tmpFile) } catch { /* */ }
+
+    if (res.code !== 0) {
+      audit('site.import.failed', { error: helperError(res) })
+      return reply.code(500).send({ error: helperError(res) })
+    }
+
+    // Parse output for domain and db password
+    const lines = res.stdout.trim().split('\n')
+    const importedDomain = lines.find((l) => l.startsWith('IMPORT-DOMAIN: '))?.slice(15) ?? ''
+    const dbPass = lines.find((l) => l.startsWith('IMPORT-DB-PASS: '))?.slice(16) ?? ''
+
+    audit('site.import', { domain: importedDomain })
+    return {
+      ok: true,
+      domain: importedDomain,
+      ...(dbPass ? { dbPass } : {}),
+      message: `Site ${importedDomain} imported successfully`,
+    }
+  })
+
   // ---- SSL & hapus ----
 
   app.post('/api/sites/:id/ssl', { preHandler: [requireAuth] }, async (req, reply) => {

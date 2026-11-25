@@ -1,0 +1,158 @@
+#!/usr/bin/env bash
+# ============================================================
+# panel-site-import — import a site bundle exported from another
+# NimbusPanel instance (or this one). Creates the site, restores
+# files, databases, and configuration.
+#
+#   sudo panel-site-import <bundle.tar.gz> [--domain <new-domain>]
+#
+# If --domain is provided, the site is imported under a new domain
+# (useful for staging). Otherwise, the original domain from
+# manifest.json is used.
+#
+# Steps:
+#   1. Extract bundle + read manifest.json
+#   2. Provision the site (vhost, user, FPM pool / proxy)
+#   3. Restore files (htdocs, shared/.env, nginx rules)
+#   4. Create databases + import dumps
+#   5. Issue SSL if the original had it and DNS points here
+# ============================================================
+set -euo pipefail
+
+DOMAIN_RE='^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$'
+PANEL_DB="/opt/panel/etc/panel.db"
+
+BUNDLE="${1:-}"
+NEW_DOMAIN=""
+
+fail() { echo "panel-site-import: $*" >&2; exit 1; }
+
+[ -f "$BUNDLE" ] || fail "bundle file not found: $BUNDLE"
+
+shift
+while (($#)); do
+    case "$1" in
+        --domain) NEW_DOMAIN="${2:-}"; shift 2 ;;
+        *) fail "unknown flag: $1" ;;
+    esac
+done
+
+# --- Extract bundle ---
+TMPDIR="$(mktemp -d)"
+trap 'rm -rf "$TMPDIR"' EXIT
+tar xzf "$BUNDLE" -C "$TMPDIR" || fail "invalid bundle format"
+
+# --- Read manifest ---
+MANIFEST="$TMPDIR/manifest.json"
+[ -f "$MANIFEST" ] || fail "manifest.json not found in bundle"
+
+DOMAIN="$(python3 -c "import json; print(json.load(open('$MANIFEST'))['domain'])" 2>/dev/null || \
+          grep -o '"domain": *"[^"]*"' "$MANIFEST" | head -1 | sed 's/.*: *"//;s/"//')"
+SITE_TYPE="$(grep -o '"type": *"[^"]*"' "$MANIFEST" | head -1 | sed 's/.*: *"//;s/"//')"
+PHP_VER="$(grep -o '"php_version": *"[^"]*"' "$MANIFEST" | head -1 | sed 's/.*: *"//;s/"//')"
+SSL_ENABLED="$(grep -o '"ssl_enabled": *[0-9]*' "$MANIFEST" | head -1 | grep -o '[0-9]*')"
+WEB_SERVER="$(grep -o '"web_server": *"[^"]*"' "$MANIFEST" | head -1 | sed 's/.*: *"//;s/"//')"
+NODE_PORT="$(grep -o '"node_port": *[0-9]*' "$MANIFEST" | head -1 | grep -o '[0-9]*')"
+
+# Override domain if specified
+if [ -n "$NEW_DOMAIN" ]; then
+    DOMAIN="$NEW_DOMAIN"
+fi
+DOMAIN="${DOMAIN,,}"
+[[ "$DOMAIN" =~ $DOMAIN_RE ]] || fail "invalid domain: $DOMAIN"
+
+echo "Importing: $DOMAIN ($SITE_TYPE)"
+echo "  PHP: ${PHP_VER:-n/a} | Web: ${WEB_SERVER:-nginx} | SSL: ${SSL_ENABLED:-0}"
+
+# --- Check if site already exists ---
+if sqlite3 "$PANEL_DB" "SELECT 1 FROM sites WHERE domain='$DOMAIN';" 2>/dev/null | grep -q 1; then
+    fail "site $DOMAIN already exists — delete it first or use --domain for a new name"
+fi
+
+# --- Provision the site ---
+echo "[1/4] Provisioning site..."
+if [ "$SITE_TYPE" = "php" ]; then
+    [ -n "$PHP_VER" ] || PHP_VER="8.3"
+    FLAGS=""
+    [ "$WEB_SERVER" = "apache" ] && FLAGS="--apache"
+    /opt/panel/bin/panel-provision-site "$DOMAIN" php "$PHP_VER" $FLAGS 2>&1 | tail -1
+elif [ "$SITE_TYPE" = "node" ]; then
+    # Allocate a new port (don't reuse old one — might conflict)
+    NEW_PORT=$(sqlite3 "$PANEL_DB" "SELECT COALESCE(MAX(node_port),31000)+1 FROM sites WHERE node_port IS NOT NULL;")
+    /opt/panel/bin/panel-provision-site "$DOMAIN" node "$NEW_PORT" 2>&1 | tail -1
+    NODE_PORT="$NEW_PORT"
+else
+    fail "unknown site type: $SITE_TYPE"
+fi
+
+# --- Restore files ---
+echo "[2/4] Restoring files..."
+SITE_ROOT="/var/www/$DOMAIN"
+SITE_USER="site-$(printf '%s' "$DOMAIN" | md5sum | cut -c1-8)"
+
+if [ -d "$TMPDIR/site/htdocs" ]; then
+    rm -rf "$SITE_ROOT/htdocs"
+    cp -a "$TMPDIR/site/htdocs" "$SITE_ROOT/htdocs"
+fi
+if [ -d "$TMPDIR/site/shared" ]; then
+    cp -a "$TMPDIR/site/shared/." "$SITE_ROOT/shared/" 2>/dev/null || true
+fi
+if [ -f "$TMPDIR/site/nginx-rules.conf" ]; then
+    mkdir -p /etc/nginx/panel-rules
+    cp "$TMPDIR/site/nginx-rules.conf" "/etc/nginx/panel-rules/$DOMAIN.conf"
+fi
+chown -R "$SITE_USER:$SITE_USER" "$SITE_ROOT"
+nginx -t >/dev/null 2>&1 && systemctl reload nginx
+
+# --- Restore databases ---
+echo "[3/4] Restoring databases..."
+if [ -d "$TMPDIR/databases" ]; then
+    for dumpfile in "$TMPDIR/databases"/*.sql.gz; do
+        [ -f "$dumpfile" ] || continue
+        DBNAME="$(basename "$dumpfile" .sql.gz)"
+        DBPASS="$(openssl rand -base64 18 | tr -dc 'A-Za-z0-9' | head -c 20)"
+        DBUSER="u_${DBNAME}"
+
+        /usr/bin/mariadb <<SQL
+CREATE DATABASE IF NOT EXISTS \`$DBNAME\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+CREATE USER IF NOT EXISTS '$DBUSER'@'localhost';
+ALTER USER '$DBUSER'@'localhost' IDENTIFIED BY '$DBPASS';
+GRANT ALL PRIVILEGES ON \`$DBNAME\`.* TO '$DBUSER'@'localhost';
+FLUSH PRIVILEGES;
+SQL
+
+        gunzip -c "$dumpfile" | /usr/bin/mariadb "$DBNAME"
+        echo "  imported: $DBNAME"
+
+        # Register in panel.db
+        SITE_ID="$(sqlite3 "$PANEL_DB" "SELECT id FROM sites WHERE domain='$DOMAIN';")"
+        sqlite3 "$PANEL_DB" "INSERT OR IGNORE INTO databases (site_id, name, db_user, db_pass) VALUES ('$SITE_ID', '$DBNAME', '$DBUSER', '$DBPASS');"
+    done
+fi
+
+# --- Register site in panel.db ---
+echo "[4/4] Registering in panel..."
+sqlite3 "$PANEL_DB" "INSERT OR REPLACE INTO sites (domain, type, php_version, node_port, ssl_enabled, web_server, repo_url, branch, node_version, build_cmd, start_cmd) VALUES ('$DOMAIN', '$SITE_TYPE', '${PHP_VER}', '${NODE_PORT:-NULL}', 0, '${WEB_SERVER:-nginx}', '', '', '', '', '');" 2>/dev/null || true
+
+# --- SSL (optional — only if DNS points here) ---
+if [ "$SSL_ENABLED" = "1" ]; then
+    echo "  (SSL was enabled on original — attempting issue...)"
+    if /opt/panel/bin/panel-issue-ssl "$DOMAIN" 2>/dev/null; then
+        FLAGS="--ssl"
+        if [ "$SITE_TYPE" = "php" ]; then
+            /opt/panel/bin/panel-provision-site "$DOMAIN" php "$PHP_VER" $FLAGS 2>/dev/null | tail -1
+        else
+            /opt/panel/bin/panel-provision-site "$DOMAIN" node "$NODE_PORT" --ssl 2>/dev/null | tail -1
+        fi
+        sqlite3 "$PANEL_DB" "UPDATE sites SET ssl_enabled=1 WHERE domain='$DOMAIN';"
+        echo "  SSL issued"
+    else
+        echo "  (SSL skipped — DNS may not point here yet)"
+    fi
+fi
+
+echo "OK: $DOMAIN imported successfully"
+echo "IMPORT-DOMAIN: $DOMAIN"
+if [ -n "${DBPASS:-}" ]; then
+    echo "IMPORT-DB-PASS: $DBPASS"
+fi

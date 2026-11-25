@@ -82,6 +82,36 @@ export default function Sites() {
     }
   }
 
+  const [showImport, setShowImport] = useState(false)
+  const [importBusy, setImportBusy] = useState(false)
+
+  async function handleImport(file: File) {
+    setImportBusy(true)
+    setError('')
+    setNotice('')
+    try {
+      const buf = await file.arrayBuffer()
+      let binary = ''
+      const bytes = new Uint8Array(buf)
+      const chunkSize = 8192
+      for (let i = 0; i < bytes.length; i += chunkSize) {
+        binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize))
+      }
+      const b64 = btoa(binary)
+      const res = await api<{ ok: boolean; domain: string; message: string }>('/sites/import', {
+        method: 'POST',
+        body: JSON.stringify({ bundleBase64: b64 }),
+      })
+      setNotice(res.message)
+      setShowImport(false)
+      await load()
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Import failed')
+    } finally {
+      setImportBusy(false)
+    }
+  }
+
   const inputCls =
     'w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900 placeholder-slate-400 outline-none transition focus:border-emerald-500 focus:ring-2 focus:ring-emerald-500/20'
 
@@ -92,14 +122,46 @@ export default function Sites() {
           <h1 className="text-xl font-semibold text-slate-900">Sites</h1>
           <p className="mt-0.5 text-sm text-slate-500">Websites and applications hosted on this server</p>
         </div>
-        <button
-          onClick={() => setShowForm((v) => !v)}
-          className="flex items-center gap-2 rounded-lg bg-emerald-600 px-4 py-2.5 text-sm font-semibold text-white transition hover:bg-emerald-500"
-        >
-          <Plus className="h-4 w-4" />
-          {showForm ? 'Cancel' : 'Add Site'}
-        </button>
+        <div className="flex gap-2">
+          <button
+            onClick={() => setShowImport((v) => !v)}
+            className="rounded-lg border border-slate-300 bg-white px-4 py-2.5 text-sm font-medium text-slate-700 transition hover:bg-slate-50"
+          >
+            {showImport ? 'Cancel Import' : '⬆ Import'}
+          </button>
+          <button
+            onClick={() => setShowForm((v) => !v)}
+            className="flex items-center gap-2 rounded-lg bg-emerald-600 px-4 py-2.5 text-sm font-semibold text-white transition hover:bg-emerald-500"
+          >
+            <Plus className="h-4 w-4" />
+            {showForm ? 'Cancel' : 'Add Site'}
+          </button>
+        </div>
       </div>
+
+      {showImport && (
+        <section className="space-y-3 rounded-xl border border-slate-200 bg-white p-6 shadow-sm">
+          <h2 className="text-sm font-semibold text-slate-900">Import Site from Bundle</h2>
+          <p className="text-xs text-slate-400">
+            Upload a site export bundle (.tar.gz) created by NimbusPanel's Export feature.
+            Files, databases, and configuration will be restored automatically.
+          </p>
+          <label className="flex cursor-pointer flex-col items-center justify-center gap-2 rounded-xl border-2 border-dashed border-slate-300 bg-slate-50 p-8 transition hover:border-emerald-400 hover:bg-emerald-50">
+            <span className="text-3xl">📦</span>
+            <span className="text-sm font-medium text-slate-600">
+              {importBusy ? 'Importing… (this may take a few minutes)' : 'Click to select bundle file (.tar.gz)'}
+            </span>
+            <span className="text-xs text-slate-400">Max ~350MB</span>
+            <input
+              type="file"
+              accept=".tar.gz,.gz"
+              className="hidden"
+              disabled={importBusy}
+              onChange={(e) => { const f = e.target.files?.[0]; if (f) handleImport(f) }}
+            />
+          </label>
+        </section>
+      )}
 
       {error && <p className="rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">{error}</p>}
       {notice && <p className="rounded-xl border border-emerald-200 bg-emerald-50 px-4 py-3 text-sm text-emerald-700">{notice}</p>}

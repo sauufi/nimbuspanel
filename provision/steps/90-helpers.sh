@@ -49,6 +49,8 @@ trap 'rm -f "$TMP"' EXIT
     echo "$PANEL_USER ALL=(root) NOPASSWD: $PANEL_BIN/panel-git-token *"
     echo "$PANEL_USER ALL=(root) NOPASSWD: $PANEL_BIN/panel-node-releases *"
     echo "$PANEL_USER ALL=(root) NOPASSWD: $PANEL_BIN/panel-disk-usage"
+    echo "$PANEL_USER ALL=(root) NOPASSWD: $PANEL_BIN/panel-site-export *"
+    echo "$PANEL_USER ALL=(root) NOPASSWD: $PANEL_BIN/panel-site-import *"
 } > "$TMP"
 
 # Backup cron is managed by the panel-backup helper itself (it reads the

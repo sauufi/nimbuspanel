@@ -1,0 +1,110 @@
+#!/usr/bin/env bash
+# ============================================================
+# panel-site-export — bundle a site (files + databases + config)
+# into a single portable .tar.gz that can be imported into any
+# NimbusPanel instance.
+#
+#   sudo panel-site-export <domain> [--output <path>]
+#
+# Bundle structure:
+#   manifest.json          → site metadata (type, php_version, ssl, env, etc.)
+#   site/                  → site files (htdocs, shared/.env, nginx rules)
+#   databases/*.sql.gz     → database dumps for this site
+#
+# Output to stdout if no --output, or to file path.
+# ============================================================
+set -euo pipefail
+
+DOMAIN_RE='^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$'
+PANEL_DB="/opt/panel/etc/panel.db"
+
+DOMAIN="${1:-}"
+OUTPUT=""
+
+fail() { echo "panel-site-export: $*" >&2; exit 1; }
+
+[ -n "$DOMAIN" ] || fail "domain required"
+DOMAIN="${DOMAIN,,}"
+[[ "$DOMAIN" =~ $DOMAIN_RE ]] || fail "invalid domain"
+
+# Parse --output flag
+shift
+while (($#)); do
+    case "$1" in
+        --output) OUTPUT="${2:-}"; shift 2 ;;
+        *) fail "unknown flag: $1" ;;
+    esac
+done
+
+SITE_ROOT="/var/www/$DOMAIN"
+[ -d "$SITE_ROOT" ] || fail "site not found: $DOMAIN"
+
+# Read site metadata from panel.db
+SITE_ROW="$(sqlite3 "$PANEL_DB" "SELECT type, COALESCE(php_version,''), COALESCE(node_port,''), ssl_enabled, COALESCE(repo_url,''), COALESCE(branch,''), COALESCE(node_version,''), COALESCE(build_cmd,''), COALESCE(start_cmd,''), COALESCE(web_server,'nginx') FROM sites WHERE domain='$DOMAIN';" 2>/dev/null || true)"
+[ -n "$SITE_ROW" ] || fail "site not in panel database: $DOMAIN"
+
+IFS='|' read -r SITE_TYPE PHP_VER NODE_PORT SSL_ENABLED REPO_URL BRANCH NODE_VER BUILD_CMD START_CMD WEB_SERVER <<< "$SITE_ROW"
+
+# Get databases linked to this site
+DB_NAMES="$(sqlite3 "$PANEL_DB" "SELECT name FROM databases WHERE site_id=(SELECT id FROM sites WHERE domain='$DOMAIN');" 2>/dev/null || true)"
+
+# Create temp bundle directory
+BUNDLE_DIR="$(mktemp -d)"
+trap 'rm -rf "$BUNDLE_DIR"' EXIT
+
+# --- manifest.json ---
+cat > "$BUNDLE_DIR/manifest.json" <<EOF
+{
+  "format": "nimbuspanel-site-export",
+  "version": 1,
+  "exported_at": "$(date -Iseconds)",
+  "domain": "$DOMAIN",
+  "type": "$SITE_TYPE",
+  "php_version": "$PHP_VER",
+  "node_port": $NODE_PORT,
+  "ssl_enabled": $SSL_ENABLED,
+  "web_server": "$WEB_SERVER",
+  "repo_url": "$REPO_URL",
+  "branch": "$BRANCH",
+  "node_version": "$NODE_VER",
+  "build_cmd": "$BUILD_CMD",
+  "start_cmd": "$START_CMD",
+  "databases": $(echo "$DB_NAMES" | grep -v '^$' | while read -r db; do echo "\"$db\""; done | sed 's/"/\\"/g;s/^/"/;s/$/"/' | paste -sd, - | sed 's/^/[/;s/$/]/' || echo '[]')
+}
+EOF
+
+# --- site files ---
+mkdir -p "$BUNDLE_DIR/site"
+if [ -d "$SITE_ROOT/htdocs" ]; then
+    tar cf - -C "$SITE_ROOT" --exclude='repo' --exclude='releases' --exclude='logs' htdocs shared 2>/dev/null | tar xf - -C "$BUNDLE_DIR/site" || true
+fi
+
+# --- nginx rules ---
+if [ -f "/etc/nginx/panel-rules/$DOMAIN.conf" ]; then
+    cp "/etc/nginx/panel-rules/$DOMAIN.conf" "$BUNDLE_DIR/site/nginx-rules.conf"
+fi
+
+# --- .htaccess (if apache mode) ---
+if [ -f "$SITE_ROOT/htdocs/.htaccess" ]; then
+    cp "$SITE_ROOT/htdocs/.htaccess" "$BUNDLE_DIR/site/htaccess-original" 2>/dev/null || true
+fi
+
+# --- databases ---
+mkdir -p "$BUNDLE_DIR/databases"
+for dbname in $DB_NAMES; do
+    [ -n "$dbname" ] || continue
+    if mariadb -N -B -e "USE \`$dbname\`;" 2>/dev/null; then
+        mariadb-dump --single-transaction --routines "$dbname" | gzip > "$BUNDLE_DIR/databases/$dbname.sql.gz"
+        echo "  dumped: $dbname"
+    fi
+done
+
+# --- create tar.gz ---
+TARFILE="${OUTPUT:-/dev/stdout}"
+tar czf "$TARFILE" -C "$BUNDLE_DIR" .
+
+if [ -n "$OUTPUT" ]; then
+    SIZE=$(du -h "$OUTPUT" | cut -f1)
+    echo "OK: exported $DOMAIN to $OUTPUT ($SIZE)"
+    echo "EXPORT-PATH: $OUTPUT"
+fi
