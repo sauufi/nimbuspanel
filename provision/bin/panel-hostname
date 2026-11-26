@@ -42,7 +42,12 @@ proxy_loc() {
             proxy_read_timeout 86400;
         }
 
-        location /api/sites/.*/deploy {
+        # Regex location (~) — long-running API calls: site deploy (build can
+        # take minutes) and site import (bundle restore). A plain prefix
+        # "location /api/sites/.*/deploy" would NOT match — without ~ the
+        # wildcards are literal characters, so requests fell through to the
+        # 120s default and long builds died with HTTP 504.
+        location ~ ^/api/sites/(import|[0-9]+/deploy)\$ {
             proxy_pass $BACKEND;
             proxy_set_header Host \$host;
             proxy_set_header X-Real-IP \$remote_addr;
