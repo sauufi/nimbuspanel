@@ -99,12 +99,16 @@ for dbname in $DB_NAMES; do
     fi
 done
 
-# --- create tar.gz ---
-TARFILE="${OUTPUT:-/dev/stdout}"
-tar czf "$TARFILE" -C "$BUNDLE_DIR" .
-
+# --- create tar.gz (always to temp file, then cat — /dev/stdout doesn't work via sudo) ---
 if [ -n "$OUTPUT" ]; then
+    tar czf "$OUTPUT" -C "$BUNDLE_DIR" .
     SIZE=$(du -h "$OUTPUT" | cut -f1)
     echo "OK: exported $DOMAIN to $OUTPUT ($SIZE)"
     echo "EXPORT-PATH: $OUTPUT"
+else
+    # No output file — write to temp and dump to stdout for API streaming
+    TMP_TAR="$(mktemp /tmp/panel-export-XXXXXX.tar.gz)"
+    tar czf "$TMP_TAR" -C "$BUNDLE_DIR" .
+    cat "$TMP_TAR"
+    rm -f "$TMP_TAR"
 fi
