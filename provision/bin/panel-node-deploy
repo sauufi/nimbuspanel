@@ -191,6 +191,17 @@ EOF
 systemctl daemon-reload
 systemctl enable "app-$SITE_ID" >/dev/null
 
+# Self-heal: the nginx vhost is written once at provision time and can go
+# stale if the site's port ever changed (nginx would proxy to a dead port
+# while the app itself is healthy). Keep its proxy_pass in sync with $PORT.
+VHOST="/etc/nginx/sites-available/$DOMAIN.conf"
+if [ -f "$VHOST" ] && grep -q "proxy_pass http://127.0.0.1:" "$VHOST" \
+    && ! grep -q "proxy_pass http://127.0.0.1:$PORT;" "$VHOST"; then
+    echo "  syncing nginx vhost proxy port -> $PORT"
+    sed -i "s|proxy_pass http://127.0.0.1:[0-9]\\+;|proxy_pass http://127.0.0.1:$PORT;|" "$VHOST"
+    nginx -t >/dev/null 2>&1 && systemctl reload nginx
+fi
+
 echo "[4/6] Activating release $TS..."
 PREV="$(readlink "$SITE_ROOT/current" 2>/dev/null || true)"
 ln -sfn "$REL" "$SITE_ROOT/current"
